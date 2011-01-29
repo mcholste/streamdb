@@ -47,9 +47,10 @@ cpanm Moose
 cpanm Date::Manip
 cpanm HTTP::Parser
 cpanm Encode
+cpanm Data::Hexify
 
 The Plack Perl web framework allows you to run a .psgi file from the command line.  Test the web interface, use Plackup (part of the Plack::Request package).  You will need a config file, but to start with you can use the one included in this package.  Start plackup like so:
-STREAMDB_CONF=streamdb.conf plackup -Iweb StreamDB.psgi
+STREAMDB_CONF=../streamdb.conf plackup StreamDB.psgi
 
 You can also run it from Apache.  To run from Apache:
 
