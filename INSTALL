@@ -1,0 +1,80 @@
+Usually, vortex is installed on a node dedicated to traffic capture, and the the web server is run on a different machine.  This does not have to be the case, however.  You can run vortex on the same node you run the web server, even without installing Apache.  To do so, use plackup as the web server as described below.
+
+On the pcap node:
+Install MySQL (must have the Merge storage engine which may require the MySQL-Max package which is installed by default on most Linux distros).  You can check to see if you have it by running mysql -e "SHOW ENGINES".
+
+Install Vortex
+  1. Make an install directory (we'll use a temp dir in this example)
+mkdir /tmp/vortex_install
+  2. Install libNIDS
+cd /tmp/vortex_install
+wget "http://downloads.sourceforge.net/project/libnids/libnids/1.24/libnids-1.24.tar.gz?r=http%3A%2F%2Fsourceforge.net%2Fprojects%2Flibnids%2Ffiles%2Flibnids%2F&ts=1295722848&use_mirror=surfnet"
+tar xzvf libnids-1.24.tar.gz && cd libnids-1.24 && ./configure && make && make install
+
+  3. Install Vortex
+cd /tmp/vortex_install
+wget "http://downloads.sourceforge.net/project/vortex-ids/vortex/2.9.0/vortex-2.9.0.tgz?r=http%3A%2F%2Fsourceforge.net%2Fprojects%2Fvortex-ids%2F&ts=1295723515&use_mirror=softlayer"
+wget "http://downloads.sourceforge.net/project/vortex-ids/libbsf/1.0.1/libbsf-1.0.1.tgz?r=http%3A%2F%2Fsourceforge.net%2Fprojects%2Fvortex-ids%2Ffiles%2Flibbsf%2F1.0.1%2F&ts=1295723688&use_mirror=softlayer"
+tar xzvf libbsf-1.0.1.tgz && cd libbsf
+gcc -g -O3 -fPIC -shared -Wl,-soname,libbsf.so.1.0.1 libbsf.c -o libbsf.so.1.0.1
+/usr/bin/install -c -c -m 644 libbsf.so.1.0.1 /usr/local/lib
+ln -s /usr/local/lib/libbsf.so.1.0.1 /usr/local/lib/libbsf.so
+/usr/bin/install -c -c -m 644 bsf.h /usr/local/include
+cd /tmp/vortex_install
+tar xzvf vortex-2.9.0.tgz && cd vortex-2.9.0
+gcc -I/usr/local/include -O3 vortex.c -o vortex -lnids -lpthread -lbsf -DWITH_BSF -lpcap -lpfring -lglib-2.0 -lnet -lgthread-2.0 -lrt
+/usr/bin/install -c -c -m 755 vortex /usr/local/bin
+
+It is *strongly* recommended that you install App::cpanminus first, as it provides the command line utility cpanm, which is vastly superior to the default cpan command line tool.
+ 
+Install the following Perl modules
+cpanm File::Slurp
+cpanm Config::JSON
+cpanm Log::Log4perl
+cpanm DBD::mysql
+
+Once the components are installed, you can test everything out like this:
+perl streamdb.pl -i eth1 -a test -d /tmp -b /tmp
+
+Once this works, it is highly recommend you install a config file.  An example is distributed in this package.
+
+On the web node (they can be the same host):
+cpanm Config::JSON
+cpanm Log::Log4perl
+cpanm DBD::mysql
+cpanm Plack
+cpanm Moose
+cpanm Date::Manip
+cpanm HTTP::Parser
+cpanm Encode
+
+The Plack Perl web framework allows you to run a .psgi file from the command line.  Test the web interface, use Plackup (part of the Plack::Request package).  You will need a config file, but to start with you can use the one included in this package.  Start plackup like so:
+STREAMDB_CONF=streamdb.conf plackup -Iweb StreamDB.psgi
+
+You can also run it from Apache.  To run from Apache:
+
+cpanm Plack::Handler::Apache2
+
+Here's an example vhost config which assumes you've installed StreamDB to /usr/local/streamdb and runs at http://streamdb/ (you'll have to edit your hosts file or setup a proper DNS name to get to it):
+
+<VirtualHost "*:80">
+        ServerName streamdb
+        <Location "/">
+                Order Allow,Deny
+                Allow from all
+                SetHandler perl-script
+                PerlSetEnv PERL5LIB /usr/local/streamdb/web
+                PerlResponseHandler Plack::Handler::Apache2
+                PerlSetVar psgi_app /usr/local/streamdb/web/StreamDB.psgi
+        </Location>
+</VirtualHost>
+
+
+If you want the run vortex on one node and the web server on another (probably the best idea), then you will need to make the files on the sensor available over NFS and edit the streamdb.conf on the web sensor to point the data_dir to the NFS directory (/mnt/nfs or whatever).  Just make sure that "data_dir" in the streamdb.conf is configured.  The NFS setup on the vortex node would be:
+
+edit /etc/exports:
+/path/to/streamdb/data_dir web.host.ip.address(ro,insecure,no_root_squash)
+
+And on the web host:
+mkdir /mnt/nfs
+mount -t nfs vortex.host.ip.address:/path/to/streamdb/data /mnt/nfs -o soft,nolock,intr

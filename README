@@ -1,0 +1,29 @@
+See INSTALL for requirements and step-by-step instructions on installing them and testing the setup.
+
+Goals:
+
+Any IDS needs a complimentary set of tools to inspect the traffic it is alerting on to provide adequate context for the alert.  StreamDB aims to closely tie in with incident analysis by providing instant access to any connection witnessed on the network within the timeframe made possible by hardware limitations.  There are other programs which attempt to do this, namely the excellent SANCP, which has a nice frontend provided by the OpenFPC framework.  The difference between SANCP/OpenFPC and StreamDB is primarily speed, scalability, and simplicity.  SANCP can incur penalties when dealing with many files on some filesystems (ext3 in particular), and because lookups are not indexed as efficiently as they are in this framework.  How fast is StreamDB?  Arbitrary IP lookups through terabytes of data complete *instantly*, as in, it takes longer for the web browser to render the page of received data than for the system to retrieve it.
+
+The components: 
+Vortex IDS (see below) reads TCP streams off of a network interface and feeds the names of the stream files to StreamDB.  The streamdb.pl script will take these files and concatenate them together into one big file and record the file offset and length to a MySQL database.  It will then batch insert these records into a connection table in MySQL for extremely fast lookups.  The StreamDB.psgi file provides the web interface for querying these streams and retrieving the printable text from them.  It also provides a hook for other possible analysis, such as the analyzing scripts available in the Ruminate IDS which also uses Vortex IDS as a source for TCP streams.  
+
+From the Vortex site (http://sourceforge.net/projects/vortex-ids/):
+"Vortex is a near real time IDS and network surveillance engine for TCP stream data. Vortex decouples packet capture, stream reassembly, and real time constraints from analysis. Vortex is used to provide TCP stream data to a separate analyzer program."
+
+All of the hard work is done by Vortex.  The main point of StreamDB, beyond providing the basic web interface, is to manage the data retention and provide a structured way to expire old streams.  The config file allows the user to set both size and time limits on the amount of data retained, and older data is automatically deleted as the new data comes in.  This framework takes Vortex output streams and records them in an indexed database so that they can be instantly recalled via the web interface provided.  At the moment, the web interface is very bare-bones, and only provides a URI-driven query interface.  Here are some example queries which should illustrate its capabilities:
+
+http://streamdb/?srcip=10.0.0.1
+http://streamdb/?dstip=10.0.0.1
+http://streamdb/?srcip=10.0.0.1&dstip=4.2.2.1
+http://streamdb/?srcip=10.0.0.1&dstip=4.2.2.1&dstport=80
+http://streamdb/?srcip=10.0.0.1&dstip=4.2.2.1&dstport=80&start=2011-01-22 00:00:00
+http://streamdb/?srcip=10.0.0.1&dstip=4.2.2.1&dstport=80&start=2011-01-22 00:00:00&end=2011-01-23 00:00:00
+http://streamdb/?srcip=10.0.0.1&dstip=4.2.2.1&dstport=80&start=2 weeks ago&end=now
+http://streamdb/?srcip=10.0.0.1&pcre=example.com
+http://streamdb/?srcip=10.0.0.1&pcre=\xff\xff\xff\xff\xff
+http://streamdb/?srcip=10.0.0.1&sort=1&as_hex=1
+http://streamdb/?srcip=10.0.0.1&raw=1
+http://streamdb/?srcip=10.0.0.1&offset=1000&limit=200
+
+See the Date::Manip module on CPAN for valid date expressions, but in general, they are extremely flexible.  An effort has been made for the query parameters to be compatible with OpenFPC (http://code.google.com/p/openfpc/).
+
