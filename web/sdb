@@ -11,7 +11,8 @@ use Log::Log4perl;
 use Getopt::Long;
 
 my $config_file = '/etc/streamdb.conf';
-my ($srcip, $dstip, $srcport, $dstport, $start, $end, $match, $debug, $verbose, $direction, $reason, $descending) = undef;
+my ($srcip, $dstip, $srcport, $dstport, $start, $end, $match, $debug, 
+	$verbose, $direction, $reason, $descending, $filetype, $headers_only) = undef;
 my $limit = 10;
 my $offset = 0;
 my $Time_fudge = 60;
@@ -24,13 +25,15 @@ GetOptions(
 	'offset=i' => \$offset,
 	'descending' => \$descending,
 	'debug=s' => \$debug,
-	'srcport=i' => \$srcport,
-	'dstport=i' => \$dstport,
+	'srcport=s' => \$srcport,
+	'dstport=s' => \$dstport,
 	'start=s' => \$start,
 	'end=s' => \$end,
 	'verbose' => \$verbose,
 	'direction=s' => \$direction,
 	'reason=s' => \$reason,
+	'filetype=s' => \$filetype,
+	'headers-only' => \$headers_only,
 );
 
 my $usage = <<'EOT'
@@ -56,7 +59,9 @@ Usage:
   e => Stream ended prematurely becuase vortex is exiting
   l => Stream size limit exceeded
   i => Connection exceeded idle limit
-[ --verbose ] Default no, prints header information for each stream matched
+[ --verbose ] Prints header information and data for each stream matched, default is just data
+[ --headers-only ] Prints only header information for each stream matched
+[ --filetype ] PCRE match on the description of the stream as per libmagic
 
 Examples: 
 
@@ -65,6 +70,8 @@ echo $(date +"%s") "192.168.1.1" "1.1.1.1" | ./sdb
 ./sdb --srcip 192.168.1.1
 ./sdb --srcip 192.168.1.1 --start "last Tuesday"
 ./sdb --dstip 1.1.1.1 --descending
+./sdb --srcip 192.168.1.1 --filetype executable --headers-only
+./sdb --srcip 192.168.1.1 --dstport \!80
 EOT
 ;
 
@@ -75,11 +82,12 @@ $query->{offset} = $offset;
 $query->{sort} = 1 if $descending;
 $query->{match} = $match if $match;
 $query->{srcport} = $srcport if defined $srcport;
-$query->{dstport} = $srcport if defined $dstport;
+$query->{dstport} = $dstport if defined $dstport;
 $query->{start} = $start if $start;
 $query->{end} = $end if $end;
 $query->{direction} = $direction if $direction;
 $query->{reason} = $reason if $reason;
+$query->{filetype} = $filetype if $filetype;
 if ($srcip or $dstip){
 	$query->{srcip} = $srcip if $srcip;
 	$query->{dstip} = $dstip if $dstip;
@@ -111,9 +119,9 @@ else {
 				$uniq{$matches[0] . '-' . $matches[1]} = [ 0, $matches[0], $matches[1] ];
 			}
 		}
-#		elsif ($_ =~ $just_src_regex){
-#			$uniq{$+{srcip}} = [ $+{srcip} ];
-#		}
+		else {
+			warn 'Unable to parse IP address from line: ' . $_;
+		}
 	}
 	
 	# Create a query per pair
@@ -151,35 +159,28 @@ my $logger = Log::Log4perl::get_logger('StreamDB') or die("Unable to init logger
 
 my $client = new StreamClient({conf => $conf, log => $logger}); 
 
-#my $query = { limit => $limit, pcre => $match };
-#if ($srcip){
-#	$query->{srcip} = $srcip;
-#}
-#if ($dstip){
-#	$query->{dstip} = $dstip;
-#}
-
 my @results;
 foreach my $query (@queries){
 	my $res;
-	if ($query->{match}){
-		$res = $client->pcre_query($query);
-	}
-	else {
-		$res = $client->query($query);
-	}
+	$res = $client->query($query);
 	push @results, $res;
 }
 
 my $total = 0;
 foreach my $res (@results){
-	foreach my $match (@{ $res->{rows} }){
+	foreach my $row (@{ $res->{rows} }){
 		$total++;
 		if ($verbose){
-			print Dumper($match) . "\n";
+			print Dumper($row) . "\n";
+		}
+		elsif ($headers_only){
+			printf("%s %s:%d %s %s:%d %ds %d bytes %s %s\n", $row->{start}, 
+				$row->{srcip}, $row->{srcport}, $row->{direction} eq 'c' ? '<-' : '->',
+				$row->{dstip}, $row->{dstport}, $row->{duration}, $row->{length}, $StreamClient::Reasons{ $row->{reason} }, 
+				join(', ', sort keys %{ $row->{metas} }));
 		}
 		else {
-			print $match->{data} . "\n";
+			print $row->{data} . "\n";
 		}
 	}
 }

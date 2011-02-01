@@ -8,26 +8,35 @@ use HTTP::Parser;
 use Encode;
 use DBI;
 use Data::Hexify;
-#use File::LibMagic qw(:easy);
+use File::LibMagic qw(:easy);
+use File::Temp;
 
 has 'log' => ( is => 'ro', isa => 'Log::Log4perl::Logger', required => 1 );
 has 'conf' => ( is => 'ro', isa => 'Config::JSON', required => 1 );
 has 'db' => ( is => 'rw', isa => 'Object', required => 0 );
+has 'magic' => (is => 'ro', isa => 'File::LibMagic', required => 1, default => sub {
+	return new File::LibMagic();
+});
 
 our %Query_params = (
-	srcip => qr/^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/,
-	dstip => qr/^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/,
-	srcport => qr/^\d{1,5}$/,
-	dstport => qr/^\d{1,5}$/,
-	start => qr/.+/, # start/end will be run through a parser for sanitization
-	end => qr/.+/,
-	offset => qr/^\d+$/,
-	limit => qr/^\d{1,5}$/,
-	pcre => qr/.+/,
-	as_hex => qr/.+/,
-	raw => qr/.+/,
-	sort => qr/.+/,
+	srcip => qr/^(?<not>\!?)(?<srcip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/,
+	dstip => qr/^(?<not>\!?)(?<dstip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/,
+	srcport => qr/^(?<not>\!?)(?<srcport>\d{1,5})$/,
+	dstport => qr/^(?<not>\!?)(?<dstport>\d{1,5})$/,
+	start => qr/(?<start>.+)/, # start/end will be run through a parser for sanitization
+	end => qr/(?<end>.+)/,
+	offset => qr/^(?<offset>\d+)$/,
+	limit => qr/^(?<limit>\d{1,5})$/,
+	pcre => qr/(?<pcre>.+)/,
+	as_hex => qr/^(?<as_hex>1)$/,
+	raw => qr/^(?<raw>1)$/,
+	sort => qr/^(?<sort>1)$/,
+	direction => qr/^(?<direction>[cs])$/,
+	quiet => qr/^(?<quiet>1)$/,
+	reason => qr/^(?<not>\!?)(?<reason>[crteli])$/,
+	filetype => qr/^(?<not>\!?)(?<filetype>[\w\s]+)/,
 );
+
 
 # Allow this to be openfpc compatible for Snorby
 our %Param_translations = (
@@ -59,7 +68,6 @@ sub BUILD {
 	return $self;
 }
 
-
 sub call {
 	my ($self, $env) = @_;
 	
@@ -70,20 +78,16 @@ sub call {
 	my $body;
 	eval {
 		my $result;
-		if ($req->query_parameters->{pcre}){
-			$result = $self->pcre_query($req->query_parameters);
-		}
-		else {
-			$result = $self->query($req->query_parameters);
-		}
+		$result = $self->query($req->query_parameters);
 		
 		$body .= 'Returning ' . (scalar @{ $result->{rows} }) . ' of ' . $result->{totalRecords} 
 			. ' at offset '. $result->{startIndex}. ' from ' .(scalar localtime($result->{min}))
 			. ' to ' . (scalar localtime($result->{max})) . "\n\n";
 		foreach my $row (sort { $a->{timestamp} <=> $b->{timestamp} } @{ $result->{rows} }){
-			$body .= sprintf("%s %s:%d %s %s:%d %ds %d bytes %s\n\n%s\n\n", $row->{start}, 
+			$body .= sprintf("%s %s:%d %s %s:%d %ds %d bytes %s %s\n\n%s\n\n", $row->{start}, 
 				$row->{srcip}, $row->{srcport}, $row->{direction} eq 'c' ? '<-' : '->',
-				$row->{dstip}, $row->{dstport}, $row->{duration}, $row->{length}, $Reasons{ $row->{reason} }, $row->{data});
+				$row->{dstip}, $row->{dstport}, $row->{duration}, $row->{length}, $Reasons{ $row->{reason} }, 
+				join(', ', sort keys %{ $row->{metas} }), $row->{data});
 		}
 	};
 	if ($@){
@@ -92,27 +96,61 @@ sub call {
 		$body = $e . "\n" . $self->_usage();
 	}
     $res->body($body);
-    #$self->_get_headers($title)
     $res->finalize;
 }
 
 sub _usage {
 	my $self = shift;
 	my $msg = <<'EOT'
+Usage:
 
-Usage: 
-srcip => qr/^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/,
-dstip => qr/^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/,
-srcport => qr/^\d{1,5}$/,
-dstport => qr/^\d{1,5}$/,
-start => qr/.+/,
-end => qr/.+/,
-offset => qr/^\d+$/,
-limit => qr/^\d{1,5}$/,
-pcre => qr/.+/,
-as_hex => qr/.+/,
-raw => qr/.+/, (do not gunzip/dechunk HTTP responses)
-sort => qr/.+/, (sort in reverse order)
+Either srcip or dstip are required.
+srcip => qr/^(?<not>\!?)(?<srcip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/,
+dstip => qr/^(?<not>\!?)(?<dstip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/,
+srcport => qr/^(?<not>\!?)(?<srcport>\d{1,5})$/,
+dstport => qr/^(?<not>\!?)(?<dstport>\d{1,5})$/,
+start => qr/(?<start>.+)/, # start/end will be run through a parser for sanitization
+end => qr/(?<end>.+)/,
+offset => qr/^(?<offset>\d+)$/,
+limit => qr/^(?<limit>\d{1,5})$/,
+pcre => qr/(?<pcre>.+)/,
+as_hex => qr/^(?<as_hex>1)$/,
+raw => qr/^(?<raw>1)$/, (do not gunzip/dechunk HTTP responses)
+sort => qr/^(?<sort>1)$/, (sort in reverse order)
+direction => qr/^(?<direction>[cs])$/,
+quiet => qr/^(?<quiet>1)$/,
+reason => qr/^(?<not>\!?)(?<reason>[crteli])$/,
+filetype => qr/^(?<not>\!?)(?<filetype>[\w\s]+)/,
+
+--srcip <Source IP address>
+--dstip <Destinatinon IP address>
+<STDIN> will be used unless srcip or dstip are specified
+[ --config <config location> ] Default /etc/streamdb.conf
+[ --match <pcre match> ]
+[ --limit <number of results to return> ] Default 10
+[ --offset <number of results to skip> ] Default 0
+[ --descending ] Reverse chronological order
+[ --debug <level> ] Default WARN or whatever is in streamdb.conf (ERROR WARN INFO DEBUG TRACE)
+[ --srcport <source port> ]
+[ --dstport <destination port> ]
+[ --start <start time>] Can be in almost any format, but should be quoted if multiword
+[ --end <end time> ]
+[ --direction <char> ] Character representing the direction, c to client, s from server
+[ --reason <char> ] Termination reason for the flow: 
+  c => Well formed TCP close
+  r => Reset
+  t => Time out
+  e => Stream ended prematurely becuase vortex is exiting
+  l => Stream size limit exceeded
+  i => Connection exceeded idle limit
+[ --verbose ] Prints header information and data for each stream matched, default is just data
+[ --headers-only ] Prints only header information for each stream matched
+[ --filetype ] PCRE match on the description of the stream as per libmagic
+
+Examples: 
+?srcip=192.168.1.1&filetype=executable
+
+
 EOT
 ;
 	return $msg;
@@ -139,28 +177,48 @@ sub query {
 			}
 			next;
 		}
-		if (not $Query_params{$param} or $given_params->{$param} !~ $Query_params{$param}){
-			die('Invalid param: ' . $param . '=' . $given_params->{$param});
+	}
+	
+	# Validate all params by only using those found in the built-in %+ PCRE named-extraction hash
+	my $validated_params = {};
+	my $validated_not_params = {};
+	foreach my $param (keys %$given_params){
+		$given_params->{$param} =~ $Query_params{$param};
+		my $not = $+{not} ? 1 : 0;
+		
+		foreach my $validated_param (keys %+){
+			next if $validated_param eq 'not'; # can't modify a read-only hash, so we'll just skip it
+			if ($not){
+				$validated_not_params->{$validated_param} = $+{$validated_param};
+			}
+			else {
+				$validated_params->{$validated_param} = $+{$validated_param};
+			}
 		}
+	}
+	
+	# Check to be sure we have either a positive search for srcip or dstip
+	unless ($validated_params->{srcip} or $validated_params->{dstip}){
+		die('No valid srcip or dstip found to search on.');
 	}
 	
 	my $start = 0;
 	my $now = time();
 	my $end = $now;
-	if ($given_params->{start} and $given_params->{start} =~ /^\d+$/){
+	if ($validated_params->{start} and $validated_params->{start} =~ /^\d+$/){
 		# Fine as is
-		$start = $given_params->{start};
+		$start = $validated_params->{start};
 	}
-	elsif ($given_params->{start}){
-		$start = UnixDate(ParseDate($given_params->{start}), '%s');
+	elsif ($validated_params->{start}){
+		$start = UnixDate(ParseDate($validated_params->{start}), '%s');
 	}
 	
-	if ($given_params->{end} and $given_params->{end} =~ /^\d+$/){
+	if ($validated_params->{end} and $validated_params->{end} =~ /^\d+$/){
 		# Fine as is
-		$end = $given_params->{end};
+		$end = $validated_params->{end};
 	}
-	elsif ($given_params->{end}){
-		$end = UnixDate(ParseDate($given_params->{end}), '%s');
+	elsif ($validated_params->{end}){
+		$end = UnixDate(ParseDate($validated_params->{end}), '%s');
 	}
 	
 	my ($query, $sth);
@@ -180,8 +238,7 @@ sub query {
 		push @tables, $row->{table_name};
 	}
 	# Now build the merge table
-	$self->db->do('DROP TABLE tmp_mrg'); # in case it was there from previous query
-	$query = 'CREATE TEMPORARY TABLE tmp_mrg LIKE streams';
+	$query = 'CREATE TEMPORARY TABLE IF NOT EXISTS tmp_mrg LIKE streams';
 	$self->db->do($query);
 	$query = 'ALTER TABLE tmp_mrg ENGINE=Merge UNION=(' . join(',', @tables) . ')';
 	$self->log->debug('Merge table query: ' . $query);
@@ -191,30 +248,58 @@ sub query {
 		'MAX(timestamp) AS max_timestamp FROM tmp_mrg';
 	
 	my $data_select = 'SELECT offset, file_id, length, INET_NTOA(srcip) AS srcip, srcport, ' .
-		'INET_NTOA(dstip) AS dstip, dstport, FROM_UNIXTIME(timestamp) AS start, duration, reason, direction FROM tmp_mrg';
+		'INET_NTOA(dstip) AS dstip, dstport, timestamp, FROM_UNIXTIME(timestamp) AS start, duration, reason, direction FROM tmp_mrg';
 	@placeholders = ();
 	my $where_clause = ' WHERE 1=1';
 	
-	# Translate ip to srcip or dstip
-	if ($given_params->{ip}){
-		$where_clause .= ' AND (srcip=INET_ATON(?) OR dstip=INET_ATON(?)';
-		push @placeholders, $given_params->{ip}, $given_params->{ip};
-	}
-	if ($given_params->{srcip}){
+	if ($validated_params->{srcip}){
 		$where_clause .= ' AND srcip=INET_ATON(?)';
-		push @placeholders, $given_params->{srcip};
+		push @placeholders, $validated_params->{srcip};
 	}
-	if ($given_params->{dstip}){
+	elsif ($validated_not_params->{srcip}){
+		$where_clause .= ' AND srcip!=INET_ATON(?)';
+		push @placeholders, $validated_not_params->{srcip};
+	}
+	
+	if ($validated_params->{dstip}){
 		$where_clause .= ' AND dstip=INET_ATON(?)';
-		push @placeholders, $given_params->{dstip};
+		push @placeholders, $validated_params->{dstip};
 	}
-	if ($given_params->{srcport}){
+	elsif ($validated_not_params->{dstip}){
+		$where_clause .= ' AND dstip!=INET_ATON(?)';
+		push @placeholders, $validated_not_params->{dstip};
+	}
+	
+	if ($validated_params->{srcport}){
 		$where_clause .= ' AND srcport=?';
-		push @placeholders, $given_params->{srcport};
+		push @placeholders, $validated_params->{srcport};
 	}
-	if ($given_params->{dstport}){
+	elsif ($validated_not_params->{srcport}){
+		$where_clause .= ' AND srcport!=?';
+		push @placeholders, $validated_not_params->{srcport};
+	}
+	
+	if ($validated_params->{dstport}){
 		$where_clause .= ' AND dstport=?';
-		push @placeholders, $given_params->{dstport};
+		push @placeholders, $validated_params->{dstport};
+	}
+	elsif ($validated_not_params->{dstport}){
+		$where_clause .= ' AND dstport!=?';
+		push @placeholders, $validated_not_params->{dstport};
+	}
+	
+	if ($validated_params->{direction}){
+		$where_clause .= ' AND direction=?';
+		push @placeholders, $validated_params->{direction};
+	}
+	
+	if ($validated_params->{reason}){
+		$where_clause .= ' AND reason=?';
+		push @placeholders, $validated_params->{reason};
+	}
+	elsif ($validated_not_params->{reason}){
+		$where_clause .= ' AND reason!=?';
+		push @placeholders, $validated_not_params->{reason};
 	}
 	
 	if ($start){
@@ -273,24 +358,28 @@ sub query {
 	
 	# limit and offset aren't actually in the query, it's an add-on param
 	my $limit = $Default_limit;
-	if ($given_params->{limit}){
-		$limit = int($given_params->{limit});
+	if ($validated_params->{limit}){
+		$limit = int($validated_params->{limit});
 	}
 	my $offset = 0;
-	if ($given_params->{offset}){
-		$offset = int($given_params->{offset});
+	if ($validated_params->{offset}){
+		$offset = int($validated_params->{offset});
 	}
-	my $order_by_dir = 'ASC';
+
+	my $direction = 'ASC';
 	if ($given_params->{sort}){
-		$order_by_dir = 'DESC';
+		$direction = 'DESC';
 	}
-	$query = $data_select . $where_clause . ' ORDER BY file_id, offset ' . $order_by_dir . ' LIMIT ?,?';
-	push @placeholders, $offset, $limit;
+	$query = $data_select . $where_clause . ' ORDER BY file_id ' . $direction . ', offset ' . $direction;
+	if (not $validated_params->{pcre} and not $validated_params->{filetype}){
+	 	$query .= ' LIMIT ?,?';
+	 	push @placeholders, $offset, $limit;
+	}
 	
 	# set pcre
 	my $pcre;
-	if ($given_params->{pcre}){
-		$pcre = qr/$given_params->{pcre}/;
+	if ($validated_params->{pcre}){
+		$pcre = qr/$validated_params->{pcre}/;
 		$self->log->debug('searching for pcre ' . Dumper($pcre));
 	}
 	
@@ -302,118 +391,96 @@ sub query {
 	my @rows;
 	# Group the rows by file_id for more efficient retrieval
 	my $file_ids = {};
-	while (my $row = $sth->fetchrow_hashref){
+	ROW_LOOP: while (my $row = $sth->fetchrow_hashref and scalar @{ $ret->{rows} } < $limit){
+		# Cache the file handle here
 		unless ($file_ids->{ $row->{file_id} }){
 			my $fh = new IO::File;
 			my $file_name = sprintf('%s/streams_%d', $self->conf->get('data_dir'), $row->{file_id});
 			$fh->open($file_name) or die($!);
 			$fh->binmode(1);
-			$file_ids->{ $row->{file_id} } = {
-				fh => $fh,
-				rows => [],
-			};
+			$file_ids->{ $row->{file_id} } = $fh;
 		}
-		push @{ $file_ids->{ $row->{file_id} }->{rows} }, $row;
-	}
-	
-	foreach my $file_id (keys %$file_ids){
-		foreach my $row (@{ $file_ids->{ $file_id }->{rows} }){
-			my $buf;
-			
-			$file_ids->{ $file_id }->{fh}->seek($row->{offset}, 0) or die($!);
-			my $num_read = $file_ids->{ $file_id }->{fh}->read($buf, $row->{length}, 0) 
-				or (push @{ $ret->{rows} }, $row and next);
-			
-			$buf = $self->_parse_content($buf) unless $given_params->{raw};
-			
-			# Perform pcre match if requested
-			if (defined $pcre){
-				if ($buf =~ $pcre){
-					$row->{data} = $self->_make_printable($buf, $given_params->{as_hex});
-					push @{ $ret->{rows} }, $row;
+		
+		# Retrieve the actual data from the data file at the given offset
+		$file_ids->{ $row->{file_id} }->seek($row->{offset}, 0) or die($!);
+		my $buf;
+		my $num_read = $file_ids->{ $row->{file_id} }->read($buf, $row->{length}, 0) 
+			or (push @{ $ret->{rows} }, $row and next);
+		
+		# Parse for filetype meta content	
+		my $metas = {};
+		$buf = $self->_parse_content($buf, $metas, $validated_params->{decode}) unless $validated_params->{raw};
+		$row->{metas} = $metas;
+		
+		# Perform filetype match if requested
+		if ($validated_params->{filetype}){
+			foreach my $meta (keys %{ $row->{metas} }){
+				#$self->log->trace('Checking meta ' . $meta . ' against ' . $validated_params->{filetype});
+				if ($meta !~ /$validated_params->{filetype}/i){
+					next ROW_LOOP;
 				}
 			}
-			else {
-				$row->{data} = $self->_make_printable($buf, $given_params->{as_hex});
+		}
+		
+		# Perform pcre match if requested
+		if (defined $pcre){
+			if ($buf =~ $pcre){
+				$row->{data} = $self->_make_printable($buf, $validated_params->{as_hex});
 				push @{ $ret->{rows} }, $row;
 			}
 		}
+		else {
+			$row->{data} = $self->_make_printable($buf, $validated_params->{as_hex});
+			push @{ $ret->{rows} }, $row;
+		}
 	}
-	
+		
 	$ret->{recordsReturned} = scalar @{ $ret->{rows} };
 	$ret->{startIndex} = $offset;
 		
 	return $ret;
 }
 
-sub pcre_query {
-	my $self = shift;
-	my $given_params = shift;
-	die ('no srcip or dstip given') unless ($given_params->{srcip} or $given_params->{dstip});
-	my $original_limit = delete $given_params->{limit};
-	my $query = $given_params;
-	$query->{limit} = 1000;
-	
-	my @matches;
-	my $offset = 0;
-	my $total_searched = 0;
-	my $bytes_searched = 0;
-	my $total_to_search = 1;
-	my ($min, $max);
-	
-	while ($total_searched < $total_to_search){
-		$query->{offset} = $offset;
-		my $res = $self->query($query);
-		$total_to_search = $res->{totalRecords} unless $total_to_search;
-		$min = $res->{min};
-		$max = $res->{max};
-		foreach my $r (@{ $res->{rows} }){
-			$total_searched++; 
-			$bytes_searched += $r->{length};
-			if ($r->{data}){ 
-				push @matches, $r; 
-			}
-		}
-		$self->log->debug("offset: $offset, bytes: $bytes_searched"); 
-		$offset += 1000;
-		last if scalar @matches >= $original_limit;
-	}
-	return {
-		rows => \@matches,
-		recordsReturned => scalar @matches,
-		totalRecords => $total_to_search,
-		startIndex => 0,
-		min => $min,
-		max => $max
-	}
-}
-
 sub _parse_content {
 	my $self = shift;
 	my $buf = shift;
+	my $metas = shift;
+	my $decode = shift;
 	my $orig = $buf;
 	
-	#TODO all kinds of content parsers here
-#	my $meta = '';
-#	if ($buf){
-#		$meta = MagicBuffer($buf);
-#	}
 	#$self->log->debug('buf: ' . Hexify($buf));
+	
+	$metas = {} unless $metas;
 	
 	my $regexp = qr/^HTTP\/1\./;
 	if ($buf =~ $regexp){
 		my $responses = $self->_parse_http($buf, 'response');
-		$self->log->debug('got ' . scalar @$responses . ' responses');
-		$buf = '';
-		foreach my $response (@$responses){
-			#$self->log->debug('response: ' . Dumper($response));
-			my $ok = $response->decode();
-			unless ($ok){
-				$self->log->error('Error decoding response.');
+		if (ref($responses)){
+			$self->log->debug('got ' . scalar @$responses . ' responses');
+			$buf = '';
+			foreach my $response (@$responses){
+				#$self->log->debug('response: ' . Dumper($response));
+				my $ok = $response->decode();
+				my $meta;
+				if ($ok){
+					$meta = $self->magic->describe_contents($response->decoded_content());
+				}
+				else {
+					$self->log->error('Error decoding response.');
+					$meta = $self->magic->describe_contents($response->as_string());
+				}
+				$buf .= $response->as_string();
+				$metas->{$meta}++;
 			}
-			
-			$buf .= $response->as_string();
 		}
+		else {
+			$self->log->warn('Unable to decode response, using raw buffer');
+			my $meta = $self->magic->describe_contents($buf);
+			$metas->{$meta}++;
+		}
+	}
+	else {
+		$metas->{ $self->magic->describe_contents($buf) }++;
 	}
 	
 	return $buf ? $buf : $orig;
@@ -451,7 +518,7 @@ sub _parse_http {
 		};
 		if ($@){
 			$self->log->warn("Error parsing request: $@");
-			last;
+			return 0;
 		}
 		if ($status == 0){
 			push @objects, $parser->object();
@@ -460,12 +527,13 @@ sub _parse_http {
 		}
 		else {
 			$self->log->error('Parse error: status: ' . $status . ' state: ' . $parser->{state} . ' data left: ' . "\n" . length($parser->{data}));
-			last;
+			return 0;
 		}
 	}
 	
 	return \@objects;
 }
+
 
 1;
 

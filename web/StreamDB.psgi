@@ -20,7 +20,7 @@ my $log_conf;
 if ($conf->get('logdir')){
 	my $log_file = $conf->get('logdir') . '/streamdb.log';
 	$log_conf = qq(
-		log4perl.category.StreamDB       = $debug_level, File, Screen
+		log4perl.category.StreamDB       = $debug_level, File
 		log4perl.appender.File			 = Log::Log4perl::Appender::File
 		log4perl.appender.File.filename  = $log_file
 		log4perl.appender.File.syswrite = 1

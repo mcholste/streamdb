@@ -24,6 +24,8 @@ http://streamdb/?srcip=10.0.0.1&pcre=\xff\xff\xff\xff\xff
 http://streamdb/?srcip=10.0.0.1&sort=1&as_hex=1
 http://streamdb/?srcip=10.0.0.1&raw=1
 http://streamdb/?srcip=10.0.0.1&offset=1000&limit=200
+http://streamdb/?srcip=10.0.0.1&filetype=executable
+http://streamdb/?srcip=10.0.0.1&dstport!80
 
 See the Date::Manip module on CPAN for valid date expressions, but in general, they are extremely flexible.  An effort has been made for the query parameters to be compatible with OpenFPC (http://code.google.com/p/openfpc/).
 
