@@ -1,0 +1,188 @@
+#!/usr/bin/perl
+
+# This script takes command line options for the query specification.  If no arguments are given, it will read from STDIN and will assume that the first parsable IP address found is the source IP and the second is a destination IP and the limit is 10.  If the format is digits IP IP, then the digits will be interpreted to be seconds since 1970.
+
+use strict;
+use Data::Dumper;
+use Time::HiRes qw(time);
+use StreamClient;  
+use Config::JSON;
+use Log::Log4perl;
+use Getopt::Long;
+
+my $config_file = '/etc/streamdb.conf';
+my ($srcip, $dstip, $srcport, $dstport, $start, $end, $match, $debug, $verbose, $direction, $reason, $descending) = undef;
+my $limit = 10;
+my $offset = 0;
+my $Time_fudge = 60;
+GetOptions(
+	'config=s' => \$config_file,
+	'srcip=s' => \$srcip,
+	'dstip=s' => \$dstip,
+	'match=s' => \$match,
+	'limit=i' => \$limit,
+	'offset=i' => \$offset,
+	'descending' => \$descending,
+	'debug=s' => \$debug,
+	'srcport=i' => \$srcport,
+	'dstport=i' => \$dstport,
+	'start=s' => \$start,
+	'end=s' => \$end,
+	'verbose' => \$verbose,
+	'direction=s' => \$direction,
+	'reason=s' => \$reason,
+);
+
+my $usage = <<'EOT'
+Usage:
+--srcip <Source IP address>
+--dstip <Destinatinon IP address>
+<STDIN> will be used unless srcip or dstip are specified
+[ --config <config location> ] Default /etc/streamdb.conf
+[ --match <pcre match> ]
+[ --limit <number of results to return> ] Default 10
+[ --offset <number of results to skip> ] Default 0
+[ --descending ] Reverse chronological order
+[ --debug <level> ] Default WARN or whatever is in streamdb.conf (ERROR WARN INFO DEBUG TRACE)
+[ --srcport <source port> ]
+[ --dstport <destination port> ]
+[ --start <start time>] Can be in almost any format, but should be quoted if multiword
+[ --end <end time> ]
+[ --direction <char> ] Character representing the direction, c to client, s from server
+[ --reason <char> ] Termination reason for the flow: 
+  c => Well formed TCP close
+  r => Reset
+  t => Time out
+  e => Stream ended prematurely becuase vortex is exiting
+  l => Stream size limit exceeded
+  i => Connection exceeded idle limit
+[ --verbose ] Default no, prints header information for each stream matched
+
+Examples: 
+
+tail /var/log/snort/alert | ./sdb --verbose
+echo $(date +"%s") "192.168.1.1" "1.1.1.1" | ./sdb
+./sdb --srcip 192.168.1.1
+./sdb --srcip 192.168.1.1 --start "last Tuesday"
+./sdb --dstip 1.1.1.1 --descending
+EOT
+;
+
+my @queries;
+my $query = {};
+$query->{limit} = $limit;
+$query->{offset} = $offset;
+$query->{sort} = 1 if $descending;
+$query->{match} = $match if $match;
+$query->{srcport} = $srcport if defined $srcport;
+$query->{dstport} = $srcport if defined $dstport;
+$query->{start} = $start if $start;
+$query->{end} = $end if $end;
+$query->{direction} = $direction if $direction;
+$query->{reason} = $reason if $reason;
+if ($srcip or $dstip){
+	$query->{srcip} = $srcip if $srcip;
+	$query->{dstip} = $dstip if $dstip;
+	push @queries, $query;
+}
+else {
+	#my $just_src_regex = qr/(?<srcip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/;
+	#my $regex = qr/(?<srcip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}).+(?<dstip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/;
+	
+	# Find unique pairs from stdin
+	my %uniq;
+	print STDERR 'Reading from STDIN...' . "\n";
+	while (<>){
+		# timestamp <whitespace> srcip, dstip
+		if (my @matches = $_ =~ /^(\d+)\s+(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\s+(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/){
+			if ((scalar @matches) == 2){
+				$uniq{$matches[1]} = [ $matches[0], $matches[1] ];
+			}
+			elsif ((scalar @matches) == 3){
+				$uniq{$matches[1] . '-' . $matches[2]} = [ $matches[0], $matches[1], $matches[2] ];
+			}
+		}
+		# generic srcip, dstip
+		elsif (@matches = $_ =~ /(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/g){
+			if ((scalar @matches) == 1){
+				$uniq{$1} = [ 0, $1 ];
+			}
+			elsif ((scalar @matches) == 2){
+				$uniq{$matches[0] . '-' . $matches[1]} = [ 0, $matches[0], $matches[1] ];
+			}
+		}
+#		elsif ($_ =~ $just_src_regex){
+#			$uniq{$+{srcip}} = [ $+{srcip} ];
+#		}
+	}
+	
+	# Create a query per pair
+	foreach my $pair (keys %uniq){
+		my $pair_query = { %$query };
+		if ($uniq{$pair}->[0]){
+			$pair_query->{start} = $uniq{$pair}->[0] - $Time_fudge;
+			$pair_query->{end} = $uniq{$pair}->[0] + $Time_fudge; 
+		}
+		$pair_query->{srcip} = $uniq{$pair}->[1];
+		$pair_query->{dstip} = $uniq{$pair}->[2] if $uniq{$pair}->[2];
+		push @queries, $pair_query;
+	}
+}
+
+die ('no source or destination IP given' . "\n\n$usage") unless scalar @queries;
+ 
+my $conf = new Config::JSON($config_file);
+my $debug_level = $debug ? $debug : $conf->get('debug_level') ? $conf->get('debug_level') : 'WARN';
+my $log_conf = qq(
+	log4perl.category.StreamDB       = $debug_level, Screen
+	log4perl.filter.ScreenLevel               = Log::Log4perl::Filter::LevelRange
+  	log4perl.filter.ScreenLevel.LevelMin  = TRACE
+  	log4perl.filter.ScreenLevel.LevelMax  = ERROR
+  	log4perl.filter.ScreenLevel.AcceptOnMatch = true
+  	log4perl.appender.Screen         = Log::Log4perl::Appender::Screen
+	log4perl.appender.Screen.Filter = ScreenLevel 
+	log4perl.appender.Screen.stderr  = 1
+	log4perl.appender.Screen.layout = Log::Log4perl::Layout::PatternLayout
+	log4perl.appender.Screen.layout.ConversionPattern = * %p [%d] %F (%L) %M %P %m%n
+);
+
+Log::Log4perl::init( \$log_conf ) or die("Unable to init logger\n");
+my $logger = Log::Log4perl::get_logger('StreamDB') or die("Unable to init logger\n"); 
+
+my $client = new StreamClient({conf => $conf, log => $logger}); 
+
+#my $query = { limit => $limit, pcre => $match };
+#if ($srcip){
+#	$query->{srcip} = $srcip;
+#}
+#if ($dstip){
+#	$query->{dstip} = $dstip;
+#}
+
+my @results;
+foreach my $query (@queries){
+	my $res;
+	if ($query->{match}){
+		$res = $client->pcre_query($query);
+	}
+	else {
+		$res = $client->query($query);
+	}
+	push @results, $res;
+}
+
+my $total = 0;
+foreach my $res (@results){
+	foreach my $match (@{ $res->{rows} }){
+		$total++;
+		if ($verbose){
+			print Dumper($match) . "\n";
+		}
+		else {
+			print $match->{data} . "\n";
+		}
+	}
+}
+
+$logger->debug("Found $total matches"); 
+ 
