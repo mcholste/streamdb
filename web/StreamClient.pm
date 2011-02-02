@@ -463,19 +463,19 @@ sub _parse_content {
 				my $ok = $response->decode();
 				my $meta;
 				if ($ok){
-					$meta = $self->magic->describe_contents($response->decoded_content());
+					$meta = $self->magic->describe_contents($response->decoded_content()) if defined $response->decoded_content();
 				}
 				else {
 					$self->log->error('Error decoding response.');
-					$meta = $self->magic->describe_contents($response->as_string());
+					$meta = $self->magic->describe_contents($response->as_string()) if defined $response->as_string();
 				}
 				$buf .= $response->as_string();
-				$metas->{$meta}++;
+				$metas->{$meta}++ if $meta;
 			}
 		}
 		else {
 			$self->log->warn('Unable to decode response, using raw buffer');
-			my $meta = $self->magic->describe_contents($buf);
+			my $meta = $self->magic->describe_contents($buf) if defined $buf;
 			$metas->{$meta}++;
 		}
 	}
