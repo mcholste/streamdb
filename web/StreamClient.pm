@@ -238,10 +238,10 @@ sub query {
 		push @tables, $row->{table_name};
 	}
 	# Now build the merge table
-	$query = 'CREATE TEMPORARY TABLE IF NOT EXISTS tmp_mrg LIKE streams';
-	$self->db->do($query);
+	$self->db->do('DROP TABLE IF EXISTS tmp_mrg') or die($DBI::errstr); # apparently, mysql doesn't like to redefine tmp merge tables sometimes
+	$self->db->do('CREATE TEMPORARY TABLE tmp_mrg LIKE streams') or die($DBI::errstr);
 	$query = 'ALTER TABLE tmp_mrg ENGINE=Merge UNION=(' . join(',', @tables) . ')';
-	$self->log->debug('Merge table query: ' . $query);
+	$self->log->debug('Merge table query: ' . $query) or die($DBI::errstr);
 	$self->db->do($query);
 	
 	my $stats_select = 'SELECT COUNT(*) AS count, MIN(timestamp) AS min_timestamp, ' . 
@@ -388,7 +388,6 @@ sub query {
 	$sth = $self->db->prepare($query);
 	$sth->execute(@placeholders);
 	
-	my @rows;
 	# Group the rows by file_id for more efficient retrieval
 	my $file_ids = {};
 	ROW_LOOP: while (my $row = $sth->fetchrow_hashref and scalar @{ $ret->{rows} } < $limit){
