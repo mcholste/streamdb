@@ -131,6 +131,11 @@ sub new {
 		}
 	}
 	
+	$self->{_BATCH_SIZE} = 100;
+	if ($self->conf->get('batch_size')){
+		$self->{_BATCH_SIZE} = int( $self->conf->get('batch_size') );
+	}
+	
 	if ($conf->get('interface')){
 		$self->{_INTERFACE} = $conf->get('interface');
 	}
@@ -142,6 +147,16 @@ sub new {
 		$self->{_INTERFACE} = 'eth1';
 	}
 	
+	if (defined $args->{read_file}){
+		if (-f $args->{read_file}){
+			$self->{_READ_FILE} = $args->{read_file};
+			$self->log->debug('Reading from pcap file ' . $self->{_READ_FILE});
+		}
+		else {
+			die('Cannot find file: ' . $args->{read_file});
+		}
+	}
+	
 	my $collect_limit = 200_000;
 	if ($self->conf->get('collect_limit')){
 		$collect_limit = $self->conf->get('collect_limit');
@@ -149,6 +164,13 @@ sub new {
 	$self->{_OPTIONS} = '-e -l -k -S ' . $collect_limit . ' -C ' . $collect_limit . ' -T 10 -E 10 ';
 	if ($conf->get('options')){
 		$self->{_OPTIONS} .= $conf->get('options');
+	}
+	
+	if ($self->{_READ_FILE}){
+		$self->{_OPTIONS} .= " -r $self->{_READ_FILE}";
+	}
+	else {
+		$self->{_OPTIONS} .= " -i $self->{_INTERFACE}";
 	}
 	
 	if ($args->{buffer_dir}){
@@ -173,7 +195,6 @@ sub new {
 		$self->{_DATA_DIR} = './';
 	}
 	
-	$self->{_BATCH_SIZE} = 100;
 	$self->{_ROLLOVER_CHECK} = $self->conf->get('rollover_check_frequency') ? $self->conf->get('rollover_check_frequency') : 10;
 
 	
@@ -285,8 +306,9 @@ sub run {
 	my @to_insert;
 	
 	$| = 1;
-	$self->log->debug("cmd: $self->{_VORTEX} -i $self->{_INTERFACE} $self->{_OPTIONS} -t $self->{_BUFFER_DIR} 2>&1");
-	open(FH, "-|", "$self->{_VORTEX} -i $self->{_INTERFACE} $self->{_OPTIONS} -t $self->{_BUFFER_DIR} 2>&1");
+	my $cmd = "$self->{_VORTEX} $self->{_OPTIONS} -t $self->{_BUFFER_DIR} 2>&1";
+	$self->log->debug("cmd: $cmd");
+	open(FH, "-|", "$cmd");
 	while (<FH>){
 		my $line_num = $.;
 		chomp;
@@ -340,6 +362,9 @@ sub run {
 		}
 	}
 	close(FH);
+	if (scalar @to_insert){
+		$self->_insert(\@to_insert);
+	}
 }
 
 sub _insert {
