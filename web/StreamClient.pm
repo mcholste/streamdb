@@ -9,7 +9,8 @@ use Encode;
 use DBI;
 use Data::Hexify;
 use File::LibMagic qw(:easy);
-use File::Temp;
+use File::Temp qw(tempfile);
+use Digest::SHA1 qw(sha1_hex);
 
 has 'log' => ( is => 'ro', isa => 'Log::Log4perl::Logger', required => 1 );
 has 'conf' => ( is => 'ro', isa => 'Config::JSON', required => 1 );
@@ -35,6 +36,8 @@ our %Query_params = (
 	quiet => qr/^(?<quiet>1)$/,
 	reason => qr/^(?<not>\!?)(?<reason>[crteli])$/,
 	filetype => qr/^(?<not>\!?)(?<filetype>[\w\s]+)/,
+	submit => qr/^(?<submit>[\w\s]+)/,
+	oid => qr/^(?<oid>\d+\-\d+\-\d+\-\d+)$/,
 );
 
 
@@ -77,30 +80,36 @@ sub call {
 	
 	my $body;
 	eval {
-		my $result;
-		$result = $self->query($req->query_parameters);
-		
-		$body .= 'Returning ' . (scalar @{ $result->{rows} }) . ' of ' . $result->{totalRecords} 
-			. ' at offset '. $result->{startIndex}. ' from ' .(scalar localtime($result->{min}))
-			. ' to ' . (scalar localtime($result->{max})) . "\n\n";
-		foreach my $row (sort { $a->{timestamp} <=> $b->{timestamp} } @{ $result->{rows} }){
-			$body .= sprintf("%s %s:%d %s %s:%d %ds %d bytes %s %s\n\n%s\n\n", $row->{start}, 
-				$row->{srcip}, $row->{srcport}, $row->{direction} eq 'c' ? '<-' : '->',
-				$row->{dstip}, $row->{dstport}, $row->{duration}, $row->{length}, $Reasons{ $row->{reason} }, 
-				join(', ', sort keys %{ $row->{metas} }), $row->{data});
+		if ($req->query_parameters->{oid}){
+			$body = $self->get_object($req->query_parameters->{oid})->{content};
+		}
+		else {
+			my $result;
+			$result = $self->query($req->query_parameters);
+			
+			$body .= 'Returning ' . (scalar @{ $result->{rows} }) . ' of ' . $result->{totalRecords} 
+				. ' at offset '. $result->{startIndex}. ' from ' .(scalar localtime($result->{min}))
+				. ' to ' . (scalar localtime($result->{max})) . "\n\n";
+			foreach my $row (sort { $a->{timestamp} <=> $b->{timestamp} } @{ $result->{rows} }){
+				for (my $i = 0; $i < @{ $row->{data} }; $i++){
+					$body .= sprintf("%s %s:%d %s %s:%d %ds %d bytes %s %s\n\n%s\n\n", $row->{start}, 
+						$row->{srcip}, $row->{srcport}, $row->{direction} eq 'c' ? '<-' : '->',
+						$row->{dstip}, $row->{dstport}, $row->{duration}, $row->{length}, $Reasons{ $row->{reason} }, 
+						$row->{objects}->[$i]->{meta}, $row->{data}->[$i]);
+				}
+			}
 		}
 	};
 	if ($@){
 		my $e = $@;
 		$self->log->error($e);
-		$body = $e . "\n" . $self->_usage();
+		$body = $e . "\n" . usage();
 	}
     $res->body($body);
     $res->finalize;
 }
 
-sub _usage {
-	my $self = shift;
+sub usage {
 	my $msg = <<'EOT'
 Usage:
 
@@ -121,9 +130,11 @@ direction => qr/^(?<direction>[cs])$/,
 quiet => qr/^(?<quiet>1)$/,
 reason => qr/^(?<not>\!?)(?<reason>[crteli])$/,
 filetype => qr/^(?<not>\!?)(?<filetype>[\w\s]+)/,
+oid => qr/^(?<oid>\d+\-\d+\-\d+\-\d+)$/,
 
 --srcip <Source IP address>
 --dstip <Destinatinon IP address>
+| --oid <oid> Retrieve a given object ID
 <STDIN> will be used unless srcip or dstip are specified
 [ --config <config location> ] Default /etc/streamdb.conf
 [ --match <pcre match> ]
@@ -221,12 +232,16 @@ sub query {
 		$end = UnixDate(ParseDate($validated_params->{end}), '%s');
 	}
 	
+	if ($validated_params->{submit}){
+		$self->{_STREAMDB_SUBMIT_FILETYPE} = $validated_params->{submit};
+	}
+	
 	my ($query, $sth);
 	
 	# Create our temporary merge table
 	my @placeholders = ($self->conf->get('db/database'));
 	$query = 'SELECT table_name FROM INFORMATION_SCHEMA.tables WHERE table_schema=? AND table_name LIKE "streams%"' . "\n" .
-		'AND ((create_time >= ? AND update_time < FROM_UNIXTIME(?)) ' .
+		'AND ((create_time >= FROM_UNIXTIME(?) AND update_time < FROM_UNIXTIME(?)) ' .
 		'OR FROM_UNIXTIME(?) BETWEEN create_time AND update_time OR FROM_UNIXTIME(?) BETWEEN create_time AND update_time)';
 	push @placeholders, $start, $end, $start, $end;
 	
@@ -407,30 +422,50 @@ sub query {
 			or (push @{ $ret->{rows} }, $row and next);
 		
 		# Parse for filetype meta content	
-		my $metas = {};
-		$buf = $self->_parse_content($buf, $metas, $validated_params->{decode}) unless $validated_params->{raw};
-		$row->{metas} = $metas;
-		
-		# Perform filetype match if requested
-		if ($validated_params->{filetype}){
-			foreach my $meta (keys %{ $row->{metas} }){
-				#$self->log->trace('Checking meta ' . $meta . ' against ' . $validated_params->{filetype});
-				if ($meta !~ /$validated_params->{filetype}/i){
-					next ROW_LOOP;
-				}
-			}
-		}
-		
-		# Perform pcre match if requested
-		if (defined $pcre){
-			if ($buf =~ $pcre){
-				$row->{data} = $self->_make_printable($buf, $validated_params->{as_hex});
-				push @{ $ret->{rows} }, $row;
-			}
+		if ($validated_params->{raw}){
+			$row->{objects} = [ { data => $buf, meta => '' } ];
 		}
 		else {
-			$row->{data} = $self->_make_printable($buf, $validated_params->{as_hex});
-			push @{ $ret->{rows} }, $row;
+			$row->{objects} = $self->_parse_content($buf);
+		}
+		
+		$row->{data} = [];
+		for (my $i = 0; $i < @{ $row->{objects} }; $i++){
+			my $object = $row->{objects}->[$i];
+			# Perform filetype match if requested
+			if ($validated_params->{filetype}){
+				#$self->log->trace('Checking meta ' . $meta . ' against ' . $validated_params->{filetype});
+				if ($object->{meta} !~ /$validated_params->{filetype}/i){
+					next;
+				}
+			}
+			
+			my $oid_str = 'oid=' . $self->_make_object_id($row, $i) . "\n\n";
+		
+			# Perform pcre match if requested
+			if (defined $pcre){
+				if ($object->{data} =~ $pcre){
+					push @{ $row->{data} }, $oid_str . $self->_make_printable($object->{data}, $validated_params->{as_hex});
+				}
+			}
+			else {
+				push @{ $row->{data} }, $oid_str . $self->_make_printable($object->{data}, $validated_params->{as_hex});
+			}
+		}
+		push @{ $ret->{rows} }, $row if scalar @{ $row->{data} };
+	}
+	
+	# Experimental code for submitting data objects to VirusTotal
+	if ($self->{_STREAMDB_SUBMIT_FILETYPE}){
+		foreach my $row (@{ $ret->{rows} }){
+			$row->{data} = '';
+			foreach my $object (@{ $row->{objects} }){
+				next if $object->{meta} =~ /INCOMPLETE/; # we know this is invalid, so don't bother submitting
+				if ($object->{meta} =~ $self->{_STREAMDB_SUBMIT_FILETYPE}){
+					$row->{data} .= Dumper($self->_submit($object->{data})) . "\n" . $object->{data};
+					next;
+				}
+			}
 		}
 	}
 		
@@ -440,16 +475,43 @@ sub query {
 	return $ret;
 }
 
+sub get_object {
+	my $self = shift;
+	my $oid = shift;
+	
+	unless ($oid =~ /^(\d+)\-(\d+)\-(\d+)\-(\d+)$/){
+		die('Invalid oid given');
+	}
+	my ($file_id, $offset, $length, $id) = ($1, $2, $3, $4);
+	
+	my $fh = new IO::File;
+	my $file_name = sprintf('%s/streams_%d', $self->conf->get('data_dir'), $file_id);
+	$fh->open($file_name) or die($!);
+	$fh->binmode(1);
+	$fh->seek($offset, 0) or die($!);
+	my $buf;
+	my $num_read = $fh->read($buf, $length, 0) or die('Data not found with oid ' . $oid);
+	my $objects = $self->_parse_content($buf);
+	return $objects->[$id];
+}
+
+sub _make_object_id {
+	my $self = shift;
+	my $row = shift;
+	my $object_index = shift;
+	
+	return join('-', $row->{file_id}, $row->{offset}, $row->{length}, $object_index);
+}
+
 sub _parse_content {
 	my $self = shift;
 	my $buf = shift;
-	my $metas = shift;
-	my $decode = shift;
+	
 	my $orig = $buf;
 	
 	#$self->log->debug('buf: ' . Hexify($buf));
 	
-	$metas = {} unless $metas;
+	my $objects = [];
 	
 	my $regexp = qr/^HTTP\/1\./;
 	if ($buf =~ $regexp){
@@ -458,31 +520,34 @@ sub _parse_content {
 			$self->log->debug('got ' . scalar @$responses . ' responses');
 			$buf = '';
 			foreach my $response (@$responses){
+				my $meta;
 				#$self->log->debug('response: ' . Dumper($response));
 				my $ok = $response->decode();
-				my $meta;
 				if ($ok){
 					$meta = $self->magic->describe_contents($response->decoded_content()) if defined $response->decoded_content();
+					if ($response->content_length() > length($response->decoded_content())){
+						$meta .= ' (INCOMPLETE)';
+					}
 				}
 				else {
 					$self->log->error('Error decoding response.');
 					$meta = $self->magic->describe_contents($response->as_string()) if defined $response->as_string();
 				}
-				$buf .= $response->as_string();
-				$metas->{$meta}++ if $meta;
+				push @$objects, { content => $response->content(), data => $response->as_string(), meta => $meta };
 			}
 		}
 		else {
 			$self->log->warn('Unable to decode response, using raw buffer');
-			my $meta = $self->magic->describe_contents($buf) if defined $buf;
-			$metas->{$meta}++;
+			my $meta = $self->magic->describe_contents($buf);
+			push @$objects, { content => $buf, data => $buf, meta => $meta };
 		}
 	}
 	else {
-		$metas->{ $self->magic->describe_contents($buf) }++;
+		my $meta = $self->magic->describe_contents($buf);
+		push @$objects, { content => $buf, data => $buf, meta => $meta };
 	}
 	
-	return $buf ? $buf : $orig;
+	return $objects;
 }
 
 sub _make_printable {
@@ -514,6 +579,7 @@ sub _parse_http {
 		my $status;       
 		eval {
 			$status = $parser->add($buf);
+			$self->log->debug('status: ' . $status . ', extra: ' . $parser->extra);
 		};
 		if ($@){
 			$self->log->warn("Error parsing request: $@");
@@ -526,11 +592,55 @@ sub _parse_http {
 		}
 		else {
 			$self->log->error('Parse error: status: ' . $status . ' state: ' . $parser->{state} . ' data left: ' . "\n" . length($parser->{data}));
-			return 0;
+			$objects[-1] and $objects[-1]->content($parser->{data});
+			last;
+		}
+	}
+	#$self->log->debug('objects: ' . Dumper(\@objects));
+	
+	return \@objects;
+}
+
+sub _submit {
+	my $self = shift;
+	my $data = shift;
+	
+	my $sha1 = sha1_hex($data);
+	my $ret = {};
+	$self->{_STREAMDB_SUBMITTED} ||= {};
+	$self->log->debug('data sha1: ' . $sha1);
+	if ($self->{_STREAMDB_SUBMITTED}->{$sha1}){
+		return $self->{_STREAMDB_SUBMITTED}->{$sha1};
+	}
+	
+	if ($self->conf->get('virustotal')){
+		require VT::API;
+		my $vt = new VT::API(key => $self->conf->get('virustotal/apikey'));
+		
+		
+		my $result = $vt->get_file_report($sha1);
+		if ($result and $result->{result}){
+			$self->log->debug('Got cached virustotal result: ' . Dumper($result));
+			$ret->{virustotal} = $result;
+		}
+		else {
+			my ($fh, $filename) = tempfile();
+			$fh->write($data);
+			$fh->close;
+			$result = $vt->scan_file($filename);
+			unlink $filename;
+			if ($result and $result->{result}){
+				$self->log->debug('Submitted to virustotal with scan_id: ' . Dumper($result));
+				$ret->{virustotal} = 'http://www.virustotal.com/file-scan/report.html?id=' . $result->{scan_id};
+			}
+			else {
+				$self->log->error('Virustotal error');
+			}
 		}
 	}
 	
-	return \@objects;
+	$self->{_STREAMDB_SUBMITTED}->{$sha1} = $ret;
+	return $ret;
 }
 
 
