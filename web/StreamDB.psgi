@@ -4,6 +4,7 @@ use Data::Dumper;
 use Log::Log4perl;
 use Config::JSON;
 use Plack::Builder;
+use Plack::Middleware::CrossOrigin;
 use StreamClient;
 
 my $config_file = '/etc/streamdb.conf';
@@ -58,11 +59,9 @@ my $log = Log::Log4perl::get_logger('StreamDB')
 	  or die("Unable to init logger\n");
 
 builder {
-#	enable 'ForwardedHeaders';
-#	enable 'Static', path => qr{^/inc/}, root => $conf->get('document_root');
+	enable 'CrossOrigin', origins => '*', methods => '*', headers => '*';
 	mount '/' => builder {
-		my $app = StreamClient->new(conf => $conf, log => $log);
-		$app->to_app;
+		StreamClient->new(conf => $conf, log => $log)->to_app;
 	};
 	mount '/favicon.ico' => sub { return [ 200, [ 'Content-Type' => 'text/plain' ], [ '' ] ]; };
 };

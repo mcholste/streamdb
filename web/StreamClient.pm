@@ -11,6 +11,7 @@ use Data::Hexify;
 use File::LibMagic qw(:easy);
 use File::Temp qw(tempfile);
 use Digest::SHA1 qw(sha1_hex);
+use JSON;
 
 has 'log' => ( is => 'ro', isa => 'Log::Log4perl::Logger', required => 1 );
 has 'conf' => ( is => 'ro', isa => 'Config::JSON', required => 1 );
@@ -38,6 +39,7 @@ our %Query_params = (
 	filetype => qr/^(?<not>\!?)(?<filetype>[\w\s]+)/,
 	submit => qr/^(?<submit>[\w\s]+)/,
 	oid => qr/^(?<oid>\d+\-\d+\-\d+\-\d+)$/,
+	as_json => qr/^(?<as_json>1)$/,
 );
 
 
@@ -77,6 +79,8 @@ sub call {
 	my $req = Plack::Request->new($env);
 	my $res = $req->new_response(200); # new Plack::Response
 	$res->content_type('text/plain');
+	$res->header('Access-Control-Allow-Origin' => '*');
+	#$res->header('Access-Control-Allow-Headers' => 'X-Requested-With');
 	
 	my $body;
 	eval {
@@ -87,15 +91,40 @@ sub call {
 			my $result;
 			$result = $self->query($req->query_parameters);
 			
-			$body .= 'Returning ' . (scalar @{ $result->{rows} }) . ' of ' . $result->{totalRecords} 
-				. ' at offset '. $result->{startIndex}. ' from ' .(scalar localtime($result->{min}))
-				. ' to ' . (scalar localtime($result->{max})) . "\n\n";
-			foreach my $row (sort { $a->{timestamp} <=> $b->{timestamp} } @{ $result->{rows} }){
-				for (my $i = 0; $i < @{ $row->{data} }; $i++){
-					$body .= sprintf("%s %s:%d %s %s:%d %ds %d bytes %s %s\n\n%s\n\n", $row->{start}, 
-						$row->{srcip}, $row->{srcport}, $row->{direction} eq 'c' ? '<-' : '->',
-						$row->{dstip}, $row->{dstport}, $row->{duration}, $row->{length}, $Reasons{ $row->{reason} }, 
-						$row->{objects}->[$i]->{meta}, $row->{data}->[$i]);
+			if ($req->query_parameters->{as_json}){
+				$res->content_type('application/javascript');
+				my $ret = [];
+				foreach my $row (sort { $a->{timestamp} <=> $b->{timestamp} } @{ $result->{rows} }){
+					for (my $i = 0; $i < @{ $row->{data} }; $i++){
+						my $ret_row = {};
+						foreach my $column qw(start srcip srcport dstip dstport duration length direction){
+							$ret_row->{$column} = $row->{$column};
+						}
+						$ret_row->{reason} = $Reasons{ $row->{reason} };
+						$ret_row->{meta} = $row->{objects}->[$i]->{meta};
+						$ret_row->{data} = $row->{data}->[$i];
+			
+						$ret_row->{label} = sprintf("%s %s:%d %s %s:%d %ds %d bytes %s %s", $row->{start}, 
+							$row->{srcip}, $row->{srcport}, $row->{direction} eq 'c' ? '<-' : '->',
+							$row->{dstip}, $row->{dstport}, $row->{duration}, $row->{length}, $Reasons{ $row->{reason} }, 
+							length($row->{objects}->[$i]->{meta}) > 50 ? 
+								substr($row->{objects}->[$i]->{meta}, 0, 50) . '...' : $row->{objects}->[$i]->{meta});
+						push @$ret, $ret_row;
+					}
+				}
+				$body = JSON->new->allow_blessed->convert_blessed->latin1->allow_nonref->pretty->encode($ret);
+			}
+			else {
+				$body .= 'Returning ' . (scalar @{ $result->{rows} }) . ' of ' . $result->{totalRecords} 
+					. ' at offset '. $result->{startIndex}. ' from ' .(scalar localtime($result->{min}))
+					. ' to ' . (scalar localtime($result->{max})) . "\n\n";
+				foreach my $row (sort { $a->{timestamp} <=> $b->{timestamp} } @{ $result->{rows} }){
+					for (my $i = 0; $i < @{ $row->{data} }; $i++){
+						$body .= sprintf("%s %s:%d %s %s:%d %ds %d bytes %s %s\n\n%s\n\n", $row->{start}, 
+							$row->{srcip}, $row->{srcport}, $row->{direction} eq 'c' ? '<-' : '->',
+							$row->{dstip}, $row->{dstport}, $row->{duration}, $row->{length}, $Reasons{ $row->{reason} }, 
+							$row->{objects}->[$i]->{meta}, $row->{data}->[$i]);
+					}
 				}
 			}
 		}
@@ -131,6 +160,7 @@ quiet => qr/^(?<quiet>1)$/,
 reason => qr/^(?<not>\!?)(?<reason>[crteli])$/,
 filetype => qr/^(?<not>\!?)(?<filetype>[\w\s]+)/,
 oid => qr/^(?<oid>\d+\-\d+\-\d+\-\d+)$/,
+as_json => qr/^(?<as_json>1)$/,
 
 --srcip <Source IP address>
 --dstip <Destinatinon IP address>
@@ -172,7 +202,7 @@ sub query {
 	my $self = shift;
 	my $given_params = shift;
 	my $is_retry = shift;
-	$self->log->debug('given_params: ' . Dumper($given_params));
+	$self->log->debug('given_params: ' . Dumper($given_params) . ', is retry: ' . $is_retry);
 	
 	# Parse the query
 	die('No query params given') unless scalar keys %$given_params;
@@ -513,6 +543,7 @@ sub _parse_content {
 	
 	my $objects = [];
 	
+	# Try to parse a request
 	my $regexp = qr/^HTTP\/1\./;
 	if ($buf =~ $regexp){
 		my $responses = $self->_parse_http($buf, 'response');
@@ -524,7 +555,7 @@ sub _parse_content {
 				#$self->log->debug('response: ' . Dumper($response));
 				my $ok = $response->decode();
 				if ($ok){
-					$meta = $self->magic->describe_contents($response->decoded_content()) if defined $response->decoded_content();
+					$meta = $response->code . ' ' . $self->magic->describe_contents($response->decoded_content()) if defined $response->decoded_content();
 					if ($response->content_length() > length($response->decoded_content())){
 						$meta .= ' (INCOMPLETE)';
 					}
@@ -533,7 +564,7 @@ sub _parse_content {
 					$self->log->error('Error decoding response.');
 					$meta = $self->magic->describe_contents($response->as_string()) if defined $response->as_string();
 				}
-				push @$objects, { content => $response->content(), data => $response->as_string(), meta => $meta };
+				push @$objects, { obj => $response, content => $response->content(), data => $response->as_string(), meta => $meta };
 			}
 		}
 		else {
@@ -542,9 +573,29 @@ sub _parse_content {
 			push @$objects, { content => $buf, data => $buf, meta => $meta };
 		}
 	}
+	# See if this is a response
 	else {
-		my $meta = $self->magic->describe_contents($buf);
-		push @$objects, { content => $buf, data => $buf, meta => $meta };
+		$regexp = qr/^(?:GET|POST|HEAD|OPTIONS|PUT|DELETE|TRACE|CONNECT)/;
+		if ($buf =~ $regexp){
+			my $requests = $self->_parse_http($buf, 'request');
+			if (ref($requests)){
+				$self->log->debug('got ' . scalar @$requests . ' requests');
+				$buf = '';
+				foreach my $request (@$requests){
+					my $meta = $request->method . ' ' . $request->header('host') . $request->uri;
+					push @$objects, { obj => $request, content => $request->content(), data => $request->as_string(), meta => $meta };
+				}
+			}
+			else {
+				$self->log->warn('Unable to decode response, using raw buffer');
+				my $meta = $self->magic->describe_contents($buf);
+				push @$objects, { content => $buf, data => $buf, meta => $meta };
+			}
+		}
+		else {
+			my $meta = $self->magic->describe_contents($buf);
+			push @$objects, { content => $buf, data => $buf, meta => $meta };
+		}
 	}
 	
 	return $objects;
@@ -575,7 +626,7 @@ sub _parse_http {
 	my @objects;
 	
 	while ($buf){
-		my $parser =  HTTP::Parser->new($type => 1);
+		my $parser = HTTP::Parser->new($type => 1);
 		my $status;       
 		eval {
 			$status = $parser->add($buf);
@@ -592,6 +643,7 @@ sub _parse_http {
 		}
 		else {
 			$self->log->error('Parse error: status: ' . $status . ' state: ' . $parser->{state} . ' data left: ' . "\n" . length($parser->{data}));
+			push @objects, $parser->object() if $parser->object();
 			$objects[-1] and $objects[-1]->content($parser->{data});
 			last;
 		}
