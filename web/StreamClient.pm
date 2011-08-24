@@ -83,7 +83,7 @@ sub call {
 	my $body;
 	eval {
 		if ($req->query_parameters->{oid}){
-			$body = $self->get_object($req->query_parameters->{oid})->{content};
+			$body = $self->get_object($req->query_parameters->{oid}, $req->query_parameters->{raw})->{content};
 		}
 		else {
 			my $result;
@@ -862,6 +862,7 @@ sub old_query {
 sub get_object {
 	my $self = shift;
 	my $oid = shift;
+	my $raw = shift;
 	
 	unless ($oid =~ /^(\d+)\-(\d+)\-(\d+)\-(\d+)$/){
 		die('Invalid oid given');
@@ -875,6 +876,7 @@ sub get_object {
 	$fh->seek($offset, 0) or die($!);
 	my $buf;
 	my $num_read = $fh->read($buf, $length, 0) or die('Data not found with oid ' . $oid);
+	return { content => $buf, data => $buf } if $raw;
 	my $objects = $self->_parse_content($buf);
 	return $objects->[$id];
 }
@@ -897,7 +899,7 @@ sub _parse_content {
 	
 	my $objects = [];
 	
-	# Try to parse a request
+	# See if this is a response
 	my $regexp = qr/^HTTP\/1\./;
 	if ($buf =~ $regexp){
 		my $responses = $self->_parse_http($buf, 'response');
@@ -915,7 +917,7 @@ sub _parse_content {
 					}
 				}
 				else {
-					$self->log->error('Error decoding response.');
+					$self->log->error('Error decoding response: ' . $@);
 					$meta = $self->magic->describe_contents($response->as_string()) if defined $response->as_string();
 				}
 				push @$objects, { obj => $response, content => $response->content(), data => $response->as_string(), meta => $meta };
@@ -927,7 +929,7 @@ sub _parse_content {
 			push @$objects, { content => $buf, data => $buf, meta => $meta };
 		}
 	}
-	# See if this is a response
+	# Try to parse a request	
 	else {
 		$regexp = qr/^(?:GET|POST|HEAD|OPTIONS|PUT|DELETE|TRACE|CONNECT)/;
 		if ($buf =~ $regexp){
@@ -996,9 +998,10 @@ sub _parse_http {
 			$buf = $parser->data();
 		}
 		else {
-			$self->log->error('Parse error: status: ' . $status . ' state: ' . $parser->{state} . ' data left: ' . "\n" . length($parser->{data}));
+			$self->log->error('Parse error: status: ' . $status . ' state: ' . $parser->{state} . ' data left: ' . length($parser->{data}));
 			push @objects, $parser->object() if $parser->object();
-			$objects[-1] and $objects[-1]->content($parser->{data});
+			# Tack the straggler chunk onto the end of the last object's content
+			$objects[-1] and $objects[-1]->{content} .= $parser->data;
 			last;
 		}
 	}
