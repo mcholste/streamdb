@@ -12,6 +12,7 @@ use File::LibMagic qw(:easy);
 use File::Temp qw(tempfile);
 use Digest::SHA1 qw(sha1_hex);
 use JSON;
+use Time::HiRes;
 
 has 'log' => ( is => 'ro', isa => 'Log::Log4perl::Logger', required => 1 );
 has 'conf' => ( is => 'ro', isa => 'Config::JSON', required => 1 );
@@ -54,7 +55,7 @@ our %Param_translations = (
 	filename => undef, 
 );
 
-our $Default_limit = 10;
+our $Default_limit = 100;
 our %Reasons = (
 	c => 'FIN',
 	r => 'RST',
@@ -87,7 +88,9 @@ sub call {
 		}
 		else {
 			my $result;
+			my $query_start_time = Time::HiRes::time();
 			$result = $self->query($req->query_parameters);
+			$result->{time_taken} = (Time::HiRes::time() - $query_start_time);
 			
 			if ($req->query_parameters->{as_json}){
 				$res->content_type('application/javascript');
@@ -117,7 +120,7 @@ sub call {
 			else {
 				$body .= 'Returning ' . $result->{recordsReturned} . ' of ' . $result->{totalRecords} 
 					. ' at offset '. $result->{startIndex}. ' from ' .(scalar localtime($result->{min}))
-					. ' to ' . (scalar localtime($result->{max})) . "\n\n";
+					. ' to ' . (scalar localtime($result->{max})) . sprintf(' (%0000d ms)', ($result->{time_taken} * 1000)) . "\n\n";
 				# Interlace the requests and responses on the same flow tuples
 				my %objects;
 				foreach my $tuple (sort keys %{ $result->{rows} }){
@@ -307,20 +310,9 @@ sub query {
 	$sth->execute(@placeholders);
 	my @tables;
 	while (my $row = $sth->fetchrow_hashref){
-		push @tables, $row->{table_name};
+		push @tables, $row->{table_name};	
 	}
-	# Now build the merge table
-	$self->db->do('DROP TABLE IF EXISTS tmp_mrg') or die($DBI::errstr); # apparently, mysql doesn't like to redefine tmp merge tables sometimes
-	$self->db->do('CREATE TEMPORARY TABLE tmp_mrg LIKE streams') or die($DBI::errstr);
-	$query = 'ALTER TABLE tmp_mrg ENGINE=Merge UNION=(' . join(',', @tables) . ')';
-	$self->log->debug('Merge table query: ' . $query) or die($DBI::errstr);
-	$self->db->do($query);
 	
-	my $stats_select = 'SELECT COUNT(*) AS count, MIN(timestamp) AS min_timestamp, ' . 
-		'MAX(timestamp) AS max_timestamp FROM tmp_mrg';
-	
-	my $data_select = 'SELECT offset, file_id, length, INET_NTOA(srcip) AS srcip, srcport, ' .
-		'INET_NTOA(dstip) AS dstip, dstport, timestamp, FROM_UNIXTIME(timestamp) AS start, duration, reason, direction FROM tmp_mrg';
 	@placeholders = ();
 	my $where_clause = ' WHERE 1=1';
 	
@@ -385,18 +377,34 @@ sub query {
 	}
 	
 	# Do the stats query
-	$query = $stats_select . $where_clause;
-	$sth = $self->db->prepare($query);
-	$self->log->debug('stats query: ' . $query . ', placeholders: ' . join(',', @placeholders));
-	$sth->execute(@placeholders);
-	my $row = $sth->fetchrow_hashref;
-	$self->log->debug('stats: ' . Dumper($row));
+	my $stats_select_template = 'SELECT COUNT(*) AS count, MIN(timestamp) AS min_timestamp, ' . 
+		'MAX(timestamp) AS max_timestamp FROM %s %s';
+	my $count = 0;
+	my $min = 2**32;
+	my $max = 0;
+	foreach my $table (@tables){
+		$query = sprintf($stats_select_template, $table, $where_clause);
+		$sth = $self->db->prepare($query);
+		$sth->execute(@placeholders);
+		
+		my $row = $sth->fetchrow_hashref;
+		$count += $row->{count};
+		if ($row->{min_timestamp} < $min){
+			$min = $row->{min_timestamp};
+		}
+		if ($row->{max_timestamp} > $max){
+			$max = $row->{max_timestamp}
+		}
+		last if $row->{count}; # short circuit as soon as we know we have results
+	}
+		
 	my $ret = {
-		totalRecords => $row->{count},
-		min => $row->{min_timestamp},
-		max => $row->{max_timestamp},
+		totalRecords => $count,
+		min => $min,
+		max => $max,
 		rows => {},
 	};
+	$self->log->debug('stats: ' . Dumper($ret));
 	
 	# If we got no results, maybe we need to flip the src/dst
 	if (not $ret->{totalRecords} and not $is_retry){
@@ -442,11 +450,6 @@ sub query {
 	if ($given_params->{sort}){
 		$direction = 'DESC';
 	}
-	$query = $data_select . $where_clause . ' ORDER BY file_id ' . $direction . ', offset ' . $direction;
-	if (not $validated_params->{pcre} and not $validated_params->{filetype}){
-	 	$query .= ' LIMIT ?,?';
-	 	push @placeholders, $offset, $limit;
-	}
 	
 	# set pcre
 	my $pcre;
@@ -454,93 +457,107 @@ sub query {
 		$pcre = qr/$validated_params->{pcre}/;
 		$self->log->debug('searching for pcre ' . Dumper($pcre));
 	}
+	if (not $validated_params->{pcre} and not $validated_params->{filetype}){
+	 	push @placeholders, $offset, $limit;
+	}
 	
-	$self->log->debug('query: ' . $query . ', placeholders: ' . join(',', @placeholders));
-	
-	$sth = $self->db->prepare($query);
-	$sth->execute(@placeholders);
-	
-	# Group the rows by file_id for more efficient retrieval
-	my $file_ids = {};
 	my $hits = 0;
-	ROW_LOOP: while (my $row = $sth->fetchrow_hashref and $hits < $limit){
-		# Cache the file handle here
-		unless ($file_ids->{ $row->{file_id} }){
-			my $fh = new IO::File;
-			my $file_name = sprintf('%s/streams_%d', $self->conf->get('data_dir'), $row->{file_id});
-			$fh->open($file_name) or die($!);
-			$fh->binmode(1);
-			$file_ids->{ $row->{file_id} } = $fh;
+	
+	my $data_select_template = 'SELECT offset, file_id, length, INET_NTOA(srcip) AS srcip, srcport, ' .
+		'INET_NTOA(dstip) AS dstip, dstport, timestamp, FROM_UNIXTIME(timestamp) AS start, duration, reason, direction ' .
+		'FROM %s %s ORDER BY file_id %s, offset %s';
+	foreach my $table (@tables){
+		$query = sprintf($data_select_template, $table, $where_clause, $direction , $direction);
+		if (not $validated_params->{pcre} and not $validated_params->{filetype}){
+		 	$query .= ' LIMIT ?,?';
 		}
 		
-		my $tuple = $self->_make_tuple($row);
-		$ret->{rows}->{$tuple} ||= [];
+		$self->log->debug('query: ' . $query . ', placeholders: ' . join(',', @placeholders));
 		
-		# Retrieve the actual data from the data file at the given offset
-		$file_ids->{ $row->{file_id} }->seek($row->{offset}, 0) or die($!);
-		my $buf;
-		my $num_read = $file_ids->{ $row->{file_id} }->read($buf, $row->{length}, 0);
-		unless ($num_read){
-			next;
-		}
+		$sth = $self->db->prepare($query);
+		$sth->execute(@placeholders);
 		
-		# Parse for filetype meta content	
-		if ($validated_params->{raw}){
-			$row->{objects} = [ { data => $buf, meta => '' } ];
-		}
-		else {
-			$row->{objects} = $self->_parse_content($buf);
-		}
+		# Group the rows by file_id for more efficient retrieval
+		my $file_ids = {};
 		
-		$row->{data} = [];
-		for (my $i = 0; $i < @{ $row->{objects} }; $i++){
-			my $object = $row->{objects}->[$i];
-			# Perform filetype match if requested
-			if ($validated_params->{filetype}){
-				#$self->log->trace('Checking meta ' . $meta . ' against ' . $validated_params->{filetype});
-				if ($object->{meta} !~ /$validated_params->{filetype}/i){
-					next;
-				}
+		ROW_LOOP: while (my $row = $sth->fetchrow_hashref and $hits < $limit){
+			# Cache the file handle here
+			unless ($file_ids->{ $row->{file_id} }){
+				my $fh = new IO::File;
+				my $file_name = sprintf('%s/streams_%d', $self->conf->get('data_dir'), $row->{file_id});
+				$fh->open($file_name) or die($!);
+				$fh->binmode(1);
+				$file_ids->{ $row->{file_id} } = $fh;
 			}
 			
-			my $oid_str = 'oid=' . $self->_make_object_id($row, $i) . "\n\n";
-		
-			# Perform pcre match if requested
-			if (defined $pcre){
-				if ($object->{data} =~ $pcre){
+			my $tuple = $self->_make_tuple($row);
+			$ret->{rows}->{$tuple} ||= [];
+			
+			# Retrieve the actual data from the data file at the given offset
+			$file_ids->{ $row->{file_id} }->seek($row->{offset}, 0) or die($!);
+			my $buf;
+			my $num_read = $file_ids->{ $row->{file_id} }->read($buf, $row->{length}, 0);
+			unless ($num_read){
+				next;
+			}
+			
+			# Parse for filetype meta content	
+			if ($validated_params->{raw}){
+				$row->{objects} = [ { data => $buf, meta => '' } ];
+			}
+			else {
+				$row->{objects} = $self->_parse_content($buf);
+			}
+			
+			$row->{data} = [];
+			for (my $i = 0; $i < @{ $row->{objects} }; $i++){
+				my $object = $row->{objects}->[$i];
+				# Perform filetype match if requested
+				if ($validated_params->{filetype}){
+					#$self->log->trace('Checking meta ' . $meta . ' against ' . $validated_params->{filetype});
+					if ($object->{meta} !~ /$validated_params->{filetype}/i){
+						next;
+					}
+				}
+				
+				my $oid_str = 'oid=' . $self->_make_object_id($row, $i) . "\n\n";
+			
+				# Perform pcre match if requested
+				if (defined $pcre){
+					if ($object->{data} =~ $pcre){
+						push @{ $row->{data} }, $oid_str . $self->_make_printable($object->{data}, $validated_params->{as_hex});
+					}
+				}
+				else {
 					push @{ $row->{data} }, $oid_str . $self->_make_printable($object->{data}, $validated_params->{as_hex});
 				}
 			}
-			else {
-				push @{ $row->{data} }, $oid_str . $self->_make_printable($object->{data}, $validated_params->{as_hex});
+			
+			if (scalar @{ $row->{data} }){
+				push @{ $ret->{rows}->{$tuple} }, $row;
+				$hits += scalar @{ $row->{data} };
 			}
 		}
-		
-		if (scalar @{ $row->{data} }){
-			push @{ $ret->{rows}->{$tuple} }, $row;
-			$hits += scalar @{ $row->{data} };
-		}
-	}
-	
-	# Experimental code for submitting data objects to VirusTotal
-	if ($self->{_STREAMDB_SUBMIT_FILETYPE}){
-		foreach my $tuple (keys %{ $ret->{rows} }){
-			foreach my $row (@{ $ret->{rows}->{$tuple} }){
-				$row->{data} = '';
-				foreach my $object (@{ $row->{objects} }){
-					next if $object->{meta} =~ /INCOMPLETE/; # we know this is invalid, so don't bother submitting
-					if ($object->{meta} =~ $self->{_STREAMDB_SUBMIT_FILETYPE}){
-						$row->{data} .= Dumper($self->_submit($object->{data})) . "\n" . $object->{data};
-						next;
+		# Experimental code for submitting data objects to VirusTotal
+		if ($self->{_STREAMDB_SUBMIT_FILETYPE}){
+			foreach my $tuple (keys %{ $ret->{rows} }){
+				foreach my $row (@{ $ret->{rows}->{$tuple} }){
+					$row->{data} = '';
+					foreach my $object (@{ $row->{objects} }){
+						next if $object->{meta} =~ /INCOMPLETE/; # we know this is invalid, so don't bother submitting
+						if ($object->{meta} =~ $self->{_STREAMDB_SUBMIT_FILETYPE}){
+							$row->{data} .= Dumper($self->_submit($object->{data})) . "\n" . $object->{data};
+							next;
+						}
 					}
 				}
 			}
 		}
 	}
-		
+	
 	$ret->{recordsReturned} = $hits;
 	$ret->{startIndex} = $offset;
-		
+	
 	return $ret;
 }
 
@@ -550,313 +567,6 @@ sub _make_tuple {
 	return sprintf("%d-%s:%d-%s:%d", $row->{timestamp}, 
 		$row->{srcip}, $row->{srcport},
 		$row->{dstip}, $row->{dstport});
-}
-
-sub old_query {
-	my $self = shift;
-	my $given_params = shift;
-	my $is_retry = shift;
-	$self->log->debug('given_params: ' . Dumper($given_params) . ', is retry: ' . $is_retry);
-	
-	# Parse the query
-	die('No query params given') unless scalar keys %$given_params;
-	
-	foreach my $param (keys %$given_params){
-		if (exists $Param_translations{$param}){
-			if (defined $Param_translations{$param}){
-				$given_params->{ $Param_translations{$param} } = delete $given_params->{$param};
-			}
-			else {
-				# Allowed but useless
-				delete $given_params->{$param};
-			}
-			next;
-		}
-	}
-	
-	# Validate all params by only using those found in the built-in %+ PCRE named-extraction hash
-	my $validated_params = {};
-	my $validated_not_params = {};
-	foreach my $param (keys %$given_params){
-		$given_params->{$param} =~ $Query_params{$param};
-		my $not = $+{not} ? 1 : 0;
-		
-		foreach my $validated_param (keys %+){
-			next if $validated_param eq 'not'; # can't modify a read-only hash, so we'll just skip it
-			if ($not){
-				$validated_not_params->{$validated_param} = $+{$validated_param};
-			}
-			else {
-				$validated_params->{$validated_param} = $+{$validated_param};
-			}
-		}
-	}
-	
-	# Check to be sure we have either a positive search for srcip or dstip
-	unless ($validated_params->{srcip} or $validated_params->{dstip}){
-		die('No valid srcip or dstip found to search on.');
-	}
-	
-	my $start = 0;
-	my $now = time();
-	my $end = $now;
-	if ($validated_params->{start} and $validated_params->{start} =~ /^\d+$/){
-		# Fine as is
-		$start = $validated_params->{start};
-	}
-	elsif ($validated_params->{start}){
-		$start = UnixDate(ParseDate($validated_params->{start}), '%s');
-	}
-	
-	if ($validated_params->{end} and $validated_params->{end} =~ /^\d+$/){
-		# Fine as is
-		$end = $validated_params->{end};
-	}
-	elsif ($validated_params->{end}){
-		$end = UnixDate(ParseDate($validated_params->{end}), '%s');
-	}
-	
-	if ($validated_params->{submit}){
-		$self->{_STREAMDB_SUBMIT_FILETYPE} = $validated_params->{submit};
-	}
-	
-	my ($query, $sth);
-	
-	# Create our temporary merge table
-	my @placeholders = ($self->conf->get('db/database'));
-	$query = 'SELECT table_name FROM INFORMATION_SCHEMA.tables WHERE table_schema=? AND table_name LIKE "streams%"' . "\n" .
-		'AND ((create_time >= FROM_UNIXTIME(?) AND update_time < FROM_UNIXTIME(?)) ' .
-		'OR FROM_UNIXTIME(?) BETWEEN create_time AND update_time OR FROM_UNIXTIME(?) BETWEEN create_time AND update_time)';
-	push @placeholders, $start, $end, $start, $end;
-	
-	$sth = $self->db->prepare($query);
-	$self->log->debug('Find tables query: ' . $query . ', placeholders: ' . join(',', @placeholders));
-	$sth->execute(@placeholders);
-	my @tables;
-	while (my $row = $sth->fetchrow_hashref){
-		push @tables, $row->{table_name};
-	}
-	# Now build the merge table
-	$self->db->do('DROP TABLE IF EXISTS tmp_mrg') or die($DBI::errstr); # apparently, mysql doesn't like to redefine tmp merge tables sometimes
-	$self->db->do('CREATE TEMPORARY TABLE tmp_mrg LIKE streams') or die($DBI::errstr);
-	$query = 'ALTER TABLE tmp_mrg ENGINE=Merge UNION=(' . join(',', @tables) . ')';
-	$self->log->debug('Merge table query: ' . $query) or die($DBI::errstr);
-	$self->db->do($query);
-	
-	my $stats_select = 'SELECT COUNT(*) AS count, MIN(timestamp) AS min_timestamp, ' . 
-		'MAX(timestamp) AS max_timestamp FROM tmp_mrg';
-	
-	my $data_select = 'SELECT offset, file_id, length, INET_NTOA(srcip) AS srcip, srcport, ' .
-		'INET_NTOA(dstip) AS dstip, dstport, timestamp, FROM_UNIXTIME(timestamp) AS start, duration, reason, direction FROM tmp_mrg';
-	@placeholders = ();
-	my $where_clause = ' WHERE 1=1';
-	
-	if ($validated_params->{srcip}){
-		$where_clause .= ' AND srcip=INET_ATON(?)';
-		push @placeholders, $validated_params->{srcip};
-	}
-	elsif ($validated_not_params->{srcip}){
-		$where_clause .= ' AND srcip!=INET_ATON(?)';
-		push @placeholders, $validated_not_params->{srcip};
-	}
-	
-	if ($validated_params->{dstip}){
-		$where_clause .= ' AND dstip=INET_ATON(?)';
-		push @placeholders, $validated_params->{dstip};
-	}
-	elsif ($validated_not_params->{dstip}){
-		$where_clause .= ' AND dstip!=INET_ATON(?)';
-		push @placeholders, $validated_not_params->{dstip};
-	}
-	
-	if ($validated_params->{srcport}){
-		$where_clause .= ' AND srcport=?';
-		push @placeholders, $validated_params->{srcport};
-	}
-	elsif ($validated_not_params->{srcport}){
-		$where_clause .= ' AND srcport!=?';
-		push @placeholders, $validated_not_params->{srcport};
-	}
-	
-	if ($validated_params->{dstport}){
-		$where_clause .= ' AND dstport=?';
-		push @placeholders, $validated_params->{dstport};
-	}
-	elsif ($validated_not_params->{dstport}){
-		$where_clause .= ' AND dstport!=?';
-		push @placeholders, $validated_not_params->{dstport};
-	}
-	
-	if ($validated_params->{direction}){
-		$where_clause .= ' AND direction=?';
-		push @placeholders, $validated_params->{direction};
-	}
-	
-	if ($validated_params->{reason}){
-		$where_clause .= ' AND reason=?';
-		push @placeholders, $validated_params->{reason};
-	}
-	elsif ($validated_not_params->{reason}){
-		$where_clause .= ' AND reason!=?';
-		push @placeholders, $validated_not_params->{reason};
-	}
-	
-	if ($start){
-		$where_clause .= ' AND timestamp >= ?';
-		push @placeholders, $start;
-	}
-	
-	if ($end != $now){
-		$where_clause .= ' AND timestamp <= ?';
-		push @placeholders, $end;
-	}
-	
-	# Do the stats query
-	$query = $stats_select . $where_clause;
-	$sth = $self->db->prepare($query);
-	$self->log->debug('stats query: ' . $query . ', placeholders: ' . join(',', @placeholders));
-	$sth->execute(@placeholders);
-	my $row = $sth->fetchrow_hashref;
-	$self->log->debug('stats: ' . Dumper($row));
-	my $ret = {
-		totalRecords => $row->{count},
-		min => $row->{min_timestamp},
-		max => $row->{max_timestamp},
-		rows => [],
-	};
-	
-	# If we got no results, maybe we need to flip the src/dst
-	if (not $ret->{totalRecords} and not $is_retry){
-		if ($given_params->{srcip} and $given_params->{dstip}){
-			my $tmp = $given_params->{dstip};
-			$given_params->{dstip} = $given_params->{srcip};
-			$given_params->{srcip} = $tmp;
-		}
-		elsif ($given_params->{srcip} and not $given_params->{dstip}){
-			$given_params->{dstip} = delete $given_params->{srcip};
-		}
-		elsif ($given_params->{dstip} and not $given_params->{srcip}){
-			$given_params->{srcip} = delete $given_params->{dstip};
-		}
-		
-		if ($given_params->{srcport} and $given_params->{dstport}){
-			my $tmp = $given_params->{dstport};
-			$given_params->{dstport} = $given_params->{srcport};
-			$given_params->{srcport} = $tmp;
-		}
-		elsif ($given_params->{srcport} and not $given_params->{dstport}){
-			$given_params->{dstport} = delete $given_params->{srcport};
-		}
-		elsif ($given_params->{dstport} and not $given_params->{srcport}){
-			$given_params->{dstport} = delete $given_params->{dstport};
-		}
-		
-		# recurse and re-rerun with swapped params
-		return $self->query($given_params, 1);
-	}
-	
-	# limit and offset aren't actually in the query, it's an add-on param
-	my $limit = $Default_limit;
-	if ($validated_params->{limit}){
-		$limit = int($validated_params->{limit});
-	}
-	my $offset = 0;
-	if ($validated_params->{offset}){
-		$offset = int($validated_params->{offset});
-	}
-
-	my $direction = 'ASC';
-	if ($given_params->{sort}){
-		$direction = 'DESC';
-	}
-	$query = $data_select . $where_clause . ' ORDER BY file_id ' . $direction . ', offset ' . $direction;
-	if (not $validated_params->{pcre} and not $validated_params->{filetype}){
-	 	$query .= ' LIMIT ?,?';
-	 	push @placeholders, $offset, $limit;
-	}
-	
-	# set pcre
-	my $pcre;
-	if ($validated_params->{pcre}){
-		$pcre = qr/$validated_params->{pcre}/;
-		$self->log->debug('searching for pcre ' . Dumper($pcre));
-	}
-	
-	$self->log->debug('query: ' . $query . ', placeholders: ' . join(',', @placeholders));
-	
-	$sth = $self->db->prepare($query);
-	$sth->execute(@placeholders);
-	
-	# Group the rows by file_id for more efficient retrieval
-	my $file_ids = {};
-	ROW_LOOP: while (my $row = $sth->fetchrow_hashref and scalar @{ $ret->{rows} } < $limit){
-		# Cache the file handle here
-		unless ($file_ids->{ $row->{file_id} }){
-			my $fh = new IO::File;
-			my $file_name = sprintf('%s/streams_%d', $self->conf->get('data_dir'), $row->{file_id});
-			$fh->open($file_name) or die($!);
-			$fh->binmode(1);
-			$file_ids->{ $row->{file_id} } = $fh;
-		}
-		
-		# Retrieve the actual data from the data file at the given offset
-		$file_ids->{ $row->{file_id} }->seek($row->{offset}, 0) or die($!);
-		my $buf;
-		my $num_read = $file_ids->{ $row->{file_id} }->read($buf, $row->{length}, 0) 
-			or (push @{ $ret->{rows} }, $row and next);
-		
-		# Parse for filetype meta content	
-		if ($validated_params->{raw}){
-			$row->{objects} = [ { data => $buf, meta => '' } ];
-		}
-		else {
-			$row->{objects} = $self->_parse_content($buf);
-		}
-		
-		$row->{data} = [];
-		for (my $i = 0; $i < @{ $row->{objects} }; $i++){
-			my $object = $row->{objects}->[$i];
-			# Perform filetype match if requested
-			if ($validated_params->{filetype}){
-				#$self->log->trace('Checking meta ' . $meta . ' against ' . $validated_params->{filetype});
-				if ($object->{meta} !~ /$validated_params->{filetype}/i){
-					next;
-				}
-			}
-			
-			my $oid_str = 'oid=' . $self->_make_object_id($row, $i) . "\n\n";
-		
-			# Perform pcre match if requested
-			if (defined $pcre){
-				if ($object->{data} =~ $pcre){
-					push @{ $row->{data} }, $oid_str . $self->_make_printable($object->{data}, $validated_params->{as_hex});
-				}
-			}
-			else {
-				push @{ $row->{data} }, $oid_str . $self->_make_printable($object->{data}, $validated_params->{as_hex});
-			}
-		}
-		push @{ $ret->{rows} }, $row if scalar @{ $row->{data} };
-	}
-	
-	# Experimental code for submitting data objects to VirusTotal
-	if ($self->{_STREAMDB_SUBMIT_FILETYPE}){
-		foreach my $row (@{ $ret->{rows} }){
-			$row->{data} = '';
-			foreach my $object (@{ $row->{objects} }){
-				next if $object->{meta} =~ /INCOMPLETE/; # we know this is invalid, so don't bother submitting
-				if ($object->{meta} =~ $self->{_STREAMDB_SUBMIT_FILETYPE}){
-					$row->{data} .= Dumper($self->_submit($object->{data})) . "\n" . $object->{data};
-					next;
-				}
-			}
-		}
-	}
-		
-	$ret->{recordsReturned} = scalar @{ $ret->{rows} };
-	$ret->{startIndex} = $offset;
-		
-	return $ret;
 }
 
 sub get_object {
