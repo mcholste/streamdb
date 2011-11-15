@@ -110,13 +110,7 @@ sub new {
 	$self->log->debug('retention size: ' . $self->conf->get('retention/size') . ' div 4gb: ' . int($self->conf->get('retention/size') / 2**32));
 	$self->log->debug("Using a table id rollover of $self->{_TABLE_ID_ROLLOVER} and Num_tables $Num_tables");
 
-	$query = 'SELECT COUNT(*) AS count FROM INFORMATION_SCHEMA.tables WHERE table_schema=?';
-	$sth = $self->db->prepare($query);
-	$sth->execute($self->{_DB_NAME});
-	$row = $sth->fetchrow_hashref;
-	unless ($row and $row->{count}){
-		$self->_init_db();
-	}
+	$self->_init_db();
 	
 	if ($conf->get('vortex') and -f $conf->get('vortex')){
 		$self->{_VORTEX} = $conf->get('vortex');
