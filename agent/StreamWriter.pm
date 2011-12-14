@@ -414,6 +414,12 @@ sub _data_file_rollover {
 	$self->log->info('Rolling over data file.');
 	$self->{_DATA_FILE_ID}++;
 	
+	# Make sure we're under SMALLINT
+	if ($self->{_DATA_FILE_ID} >= 2**16){
+		$self->log->info(q{Congratulations! You've created 65535 files, wrapping around to 1!});
+		$self->{_DATA_FILE_ID} = 1;
+	}
+	
 	# Start the new fh
 	$self->{_DATA_FH}->close();
 	$self->_open_data_fh();
