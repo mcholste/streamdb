@@ -28,10 +28,7 @@ gcc -I/usr/local/include -O3 vortex.c -o vortex -lnids -lpthread -lbsf -DWITH_BS
 It is *strongly* recommended that you install App::cpanminus first, as it provides the command line utility cpanm, which is vastly superior to the default cpan command line tool.
  
 Install the following Perl modules
-cpanm File::Slurp
-cpanm Config::JSON
-cpanm Log::Log4perl
-cpanm DBD::mysql
+cpanm File::Slurp Config::JSON Log::Log4perl DBD::mysql
 
 Once the components are installed, you can test everything out like this:
 perl streamdb.pl -i eth1 -a test -d /tmp -b /tmp
@@ -39,15 +36,7 @@ perl streamdb.pl -i eth1 -a test -d /tmp -b /tmp
 Once this works, it is highly recommend you install a config file.  An example is distributed in this package.
 
 On the web node (they can be the same host):
-cpanm Config::JSON
-cpanm Log::Log4perl
-cpanm DBD::mysql
-cpanm Plack
-cpanm Moose
-cpanm Date::Manip
-cpanm HTTP::Parser
-cpanm Encode
-cpanm Data::Hexify
+cpanm Config::JSON Log::Log4perl DBD::mysql Plack Moose Date::Manip HTTP::Parser Encode Data::Hexify Digest::MD5 LWP::UserAgent HTTP::Request::Common
 
 The Plack Perl web framework allows you to run a .psgi file from the command line.  To test the web interface, use Plackup (part of the Plack::Request package).  You will need a config file, but to start with you can use the one included in this package.  Start plackup like so:
 STREAMDB_CONF=../streamdb.conf plackup StreamDB.psgi

@@ -12,6 +12,8 @@ use Net::Server::Daemonize qw(daemonize);
 our $Prefix = 'streams_';
 our $Num_tables = 100;
 
+$SIG{CHLD} = 'IGNORE'; # will do the wait() so we don't create zombies
+
 sub new {
 	my $class = shift;
 	my $args = shift;
@@ -458,7 +460,7 @@ sub _check_rollover {
 		while (my $short_file = readdir(DIR)){
 			if ($short_file =~ /^$Prefix(\d+)$/o){
 				my $part_id = $1;
-				if ($part_id < ($file_id + $self->{_TABLE_ID_ROLLOVER})){
+				if ($part_id >= $file_id and $part_id < ($file_id + $self->{_TABLE_ID_ROLLOVER})){
 					my $data_file_name = $self->conf->get('data_dir') . '/' . $Prefix . $part_id;
 					$self->log->info('Dropping data file ' . $data_file_name);
 					unlink $data_file_name;

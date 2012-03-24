@@ -13,6 +13,9 @@ use File::Temp qw(tempfile);
 use Digest::SHA1 qw(sha1_hex);
 use JSON;
 use Time::HiRes;
+use Digest::MD5;
+use LWP::UserAgent;
+use HTTP::Request::Common;
 
 has 'log' => ( is => 'ro', isa => 'Log::Log4perl::Logger', required => 1 );
 has 'conf' => ( is => 'ro', isa => 'Config::JSON', required => 1 );
@@ -542,11 +545,11 @@ sub query {
 		if ($self->{_STREAMDB_SUBMIT_FILETYPE}){
 			foreach my $tuple (keys %{ $ret->{rows} }){
 				foreach my $row (@{ $ret->{rows}->{$tuple} }){
-					$row->{data} = '';
+					$row->{data} = [];
 					foreach my $object (@{ $row->{objects} }){
 						next if $object->{meta} =~ /INCOMPLETE/; # we know this is invalid, so don't bother submitting
 						if ($object->{meta} =~ $self->{_STREAMDB_SUBMIT_FILETYPE}){
-							$row->{data} .= Dumper($self->_submit($object->{data})) . "\n" . $object->{data};
+							push @{ $row->{data} }, 'OUTPUT FROM SUBMIT: ' . Dumper($self->_submit($object->{content})) . "\n" . $self->_make_printable($object->{data}, $validated_params->{as_hex});
 							next;
 						}
 					}
@@ -620,17 +623,33 @@ sub _parse_content {
 				my $meta;
 				#$self->log->debug('response: ' . Dumper($response));
 				my $ok = $response->decode();
+				my $content = $response->content();
+				my $data = $response->as_string();
 				if ($ok){
-					$meta = $response->code . ' ' . $self->magic->describe_contents($response->decoded_content()) if defined $response->decoded_content();
-					if ($response->content_length() > length($response->decoded_content())){
-						$meta .= ' (INCOMPLETE)';
+					my $decoded_content = $response->decoded_content();
+					if (defined $decoded_content){
+						my $description = $self->magic->describe_contents($decoded_content);
+						$content = $decoded_content;
+						$meta = $response->code . ' ' . $description;
+						if ($response->content_length() > length($decoded_content)){
+							$meta .= ' (INCOMPLETE)';
+						}
+						elsif ($description eq 'data'){ # only check unknown descriptions for obfuscation
+							if (my $deobfuscated_content = $self->_unxor_exe($decoded_content)){
+								#$data = $deobfuscated_content;
+								$content = $deobfuscated_content;
+								$meta = $response->code . ' XOR obfuscated ' . $self->magic->describe_contents($content);
+								#$meta = $response->code . ' XOR obfuscated ' . $self->magic->describe_contents($data);
+							}
+						}
+						#$self->log->debug('decoded_content: ' . Dumper($decoded_content) . ', data: ' . Dumper($data));
 					}
 				}
 				else {
 					$self->log->error('Error decoding response: ' . $@);
 					$meta = $self->magic->describe_contents($response->as_string()) if defined $response->as_string();
 				}
-				push @$objects, { obj => $response, content => $response->content(), data => $response->as_string(), meta => $meta };
+				push @$objects, { obj => $response, content => $content, data => $data, meta => $meta };
 			}
 		}
 		else {
@@ -757,9 +776,77 @@ sub _submit {
 			}
 		}
 	}
+	elsif ($self->conf->get('sandbox_url')){
+		my ($fh, $filename) = tempfile();
+		$fh->write($data);
+		$fh->close;
+		my $ua = new LWP::UserAgent();
+		my $req = POST $self->conf->get('sandbox_url'), 
+			[ 
+				'upload[filename]' => [ $filename ],
+				'commit' => 'Upload'
+			],
+			'Content_Type' => 'form-data';
+				
+		my $res = $ua->request($req);
+		$ret = $res->content();
+		$self->log->trace('ret: ' . Dumper($ret));
+		unlink $filename;
+	}
 	
 	$self->{_STREAMDB_SUBMITTED}->{$sha1} = $ret;
 	return $ret;
+}
+
+sub _unxor_exe {
+	my $self = shift;
+	my $buf = shift;
+	
+	# Find xor key for two bytes of MZ in exe header
+	my @expected_first_bytes = unpack("C*", pack("A*", 'MZ'));
+	my @chars = unpack('C*', $buf);
+	my @keyarr;
+	for (my $i = 0; $i < @expected_first_bytes; $i++){
+	        push @keyarr, $expected_first_bytes[$i] ^ $chars[$i];
+	}
+	my $keylen = scalar @keyarr;
+	
+	# Unxor with that key
+	for (my $i = 0; $i < length($buf); $i += $keylen){
+	        for (my $j = 0; $j < $keylen; $j++){
+	                $chars[$i+$j] = chr($chars[$i+$j] ^ $keyarr[$j]);
+	        }
+	}
+	
+	my $newbuf = join('', @chars);
+	
+	# Test for exe
+	if ($self->magic->describe_contents($newbuf) =~ /80386/){
+		return $newbuf;
+	}
+	
+	# Try the first n bytes as the key
+	my @lengths_to_try = (4,8,16,32);
+	foreach my $length_to_try (@lengths_to_try){
+		@chars = unpack('C*', $buf);
+		@keyarr = splice(@chars, 0, $length_to_try);
+		$keylen = scalar @keyarr;
+		#$self->log->debug('using key ' . unpack('H*', @keyarr));
+		# Unxor with that key
+		for (my $i = 0; $i < length($buf); $i += $keylen){
+		        for (my $j = 0; $j < $keylen; $j++){
+		                $chars[$i+$j] = chr($chars[$i+$j] ^ $keyarr[$j]);
+		        }
+		}
+		$newbuf = join('', @chars);
+		
+		# Test for exe
+		if ($self->magic->describe_contents($newbuf) =~ /80386/){
+			return $newbuf;
+		}
+	}
+	
+	return undef;
 }
 
 
