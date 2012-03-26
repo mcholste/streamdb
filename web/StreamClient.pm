@@ -783,8 +783,7 @@ sub _submit {
 		my $ua = new LWP::UserAgent();
 		my $req = POST $self->conf->get('sandbox_url'), 
 			[ 
-				'upload[filename]' => [ $filename ],
-				'commit' => 'Upload'
+				'filename' => [ $filename ]
 			],
 			'Content_Type' => 'form-data';
 				
