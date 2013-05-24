@@ -352,10 +352,10 @@ sub run {
 			$self->_insert(\@to_insert);
 			@to_insert = ();
 		}
-		if ($line_num % ($self->{_BATCH_SIZE} * $self->{_ROLLOVER_CHECK}) == 0){ # This is expensive, so we only do it every ROLLOVER_CHECK times
-			$self->_check_rollover();
-			#$self->log->trace("line num: $line_num, batch size: $self->{_BATCH_SIZE}, rollover check: $self->{_ROLLOVER_CHECK}, test: " . $. % ($self->{_BATCH_SIZE} * $self->{_ROLLOVER_CHECK}));
-		}
+#		if ($line_num % ($self->{_BATCH_SIZE} * $self->{_ROLLOVER_CHECK}) == 0){ # This is expensive, so we only do it every ROLLOVER_CHECK times
+#			$self->_check_rollover();
+#			#$self->log->trace("line num: $line_num, batch size: $self->{_BATCH_SIZE}, rollover check: $self->{_ROLLOVER_CHECK}, test: " . $. % ($self->{_BATCH_SIZE} * $self->{_ROLLOVER_CHECK}));
+#		}
 	}
 	close(FH);
 	if (scalar @to_insert){
@@ -426,49 +426,52 @@ sub _data_file_rollover {
 	$self->{_DATA_FH}->close();
 	$self->_open_data_fh();
 	
+	$self->_check_rollover();
+	
 	return 1;
 }
 
 sub _check_rollover {	
 	my $self = shift;
-	my ($query, $sth);
 	
 	#$self->log->trace('checking rollover');
+	
+	# Are we over the retention size?
+	while (($self->_get_db_size() + $self->_get_files_size()) > $self->conf->get('retention/size')){
+		$self->_drop_oldest();
+	}
+}
+
+sub _drop_oldest {
+	my $self = shift;
+	my ($query, $sth);
 		
-	# Do we need to delete the oldest?
-	$query = 'SELECT COUNT(*) AS count FROM INFORMATION_SCHEMA.tables WHERE table_schema=? AND table_name LIKE "' . $Prefix . '%"';
+	$query = 'SELECT table_name FROM INFORMATION_SCHEMA.tables WHERE table_schema=? ' . "\n" .
+		'AND table_name LIKE "' . $Prefix . '%" ORDER BY create_time ASC LIMIT 1';
 	$sth = $self->db->prepare($query);
 	$sth->execute($self->{_DB_NAME});
 	my $row = $sth->fetchrow_hashref;
-	my $num_tables = $row->{count};
+	my $table_name = $row->{table_name};
+	$query = 'DROP TABLE ' . $table_name;
+	$self->db->do($query);
+	$self->log->info('Dropped oldest table ' . $table_name);
 	
-	if ($num_tables > $Num_tables){
-		$query = 'SELECT table_name FROM INFORMATION_SCHEMA.tables WHERE table_schema=? ' . "\n" .
-			'AND table_name LIKE "' . $Prefix . '%" ORDER BY create_time ASC LIMIT 1';
-		$sth = $self->db->prepare($query);
-		$sth->execute($self->{_DB_NAME});
-		$row = $sth->fetchrow_hashref;
-		my $table_name = $row->{table_name};
-		$query = 'DROP TABLE ' . $table_name;
-		$self->db->do($query);
-		$self->log->info('Dropped oldest table ' . $table_name);
-		
-		# Drop corresponding files
-		$table_name =~ /^$Prefix(\d+)$/;
-		my $file_id = $1;
-		opendir(DIR, $self->conf->get('data_dir'));
-		while (my $short_file = readdir(DIR)){
-			if ($short_file =~ /^$Prefix(\d+)$/o){
-				my $part_id = $1;
-				if ($part_id >= $file_id and $part_id < ($file_id + $self->{_TABLE_ID_ROLLOVER})){
-					my $data_file_name = $self->conf->get('data_dir') . '/' . $Prefix . $part_id;
-					$self->log->info('Dropping data file ' . $data_file_name);
-					unlink $data_file_name;
-				}
+	# Drop corresponding files
+	$table_name =~ /^$Prefix(\d+)$/;
+	my $file_id = $1;
+	opendir(DIR, $self->conf->get('data_dir'));
+	while (my $short_file = readdir(DIR)){
+		if ($short_file =~ /^$Prefix(\d+)$/o){
+			my $part_id = $1;
+			if ($part_id >= $file_id and $part_id < ($file_id + $self->{_TABLE_ID_ROLLOVER})){
+				my $data_file_name = $self->conf->get('data_dir') . '/' . $Prefix . $part_id;
+				$self->log->info('Dropping data file ' . $data_file_name);
+				unlink $data_file_name;
 			}
 		}
-		close(DIR);
 	}
+	close(DIR);
+	
 }
 
 sub _get_db_size {
