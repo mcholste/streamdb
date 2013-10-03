@@ -30,7 +30,26 @@ sub new {
 	
 	bless $self, $class;
 	
-	$self->{_RETENTION_SIZE} = $self->conf->get('retention/size') ? $self->conf->get('retention/size') : 2 * 2**32; # 8GB
+	my $size_limit = $self->conf->get('retention/size');
+	unless ($size_limit){
+		die('No retention size specified in config');
+	}
+	if ($size_limit =~ /(\d+)([GMT])$/){
+		if( $2 eq 'T' ) {
+			$size_limit = $1 * 2**40;
+		}
+		elsif( $2 eq 'G' ) {
+			$size_limit = $1 * 2**30;
+		} 
+		elsif( $2 eq 'M' ) {
+			$size_limit = $1 * 2**20;
+		}
+	}
+	unless ($size_limit){
+		die('Invalid retention size specified in config');
+	}
+	
+	$self->{_RETENTION_SIZE} = $size_limit;
 	
 	my $debug_level = $self->conf->get('debug_level') ? $self->conf->get('debug_level') : 'INFO';
 	
@@ -102,14 +121,14 @@ sub new {
 	
 	$self->log->debug('Initial file id: ' . $self->{_DATA_FILE_ID});
 	
-	$self->{_TABLE_ID_ROLLOVER} = int($self->conf->get('retention/size') / 2**32);
+	$self->{_TABLE_ID_ROLLOVER} = int($self->{_RETENTION_SIZE} / 2**32);
 	if ($self->{_TABLE_ID_ROLLOVER} > $Num_tables){
 		$self->{_TABLE_ID_ROLLOVER} = int($self->{_TABLE_ID_ROLLOVER} / $Num_tables);
 	}
 	else {
 		$Num_tables = $self->{_TABLE_ID_ROLLOVER};
 	}
-	$self->log->debug('retention size: ' . $self->conf->get('retention/size') . ' div 4gb: ' . int($self->conf->get('retention/size') / 2**32));
+	$self->log->debug('retention size: ' . $self->{_RETENTION_SIZE} . ' div 4gb: ' . int($self->{_RETENTION_SIZE} / 2**32));
 	$self->log->debug("Using a table id rollover of $self->{_TABLE_ID_ROLLOVER} and Num_tables $Num_tables");
 
 	$self->_init_db();
@@ -437,7 +456,7 @@ sub _check_rollover {
 	#$self->log->trace('checking rollover');
 	
 	# Are we over the retention size?
-	while (($self->_get_db_size() + $self->_get_files_size()) > $self->conf->get('retention/size')){
+	while (($self->_get_db_size() + $self->_get_files_size()) > $self->{_RETENTION_SIZE}){
 		$self->_drop_oldest();
 	}
 }
