@@ -10,7 +10,7 @@ use Log::Log4perl;
 use Net::Server::Daemonize qw(daemonize);
 
 our $Prefix = 'streams_';
-our $Num_tables = 100;
+our $Table_rollover = 10;
 
 $SIG{CHLD} = 'IGNORE'; # will do the wait() so we don't create zombies
 
@@ -121,15 +121,16 @@ sub new {
 	
 	$self->log->debug('Initial file id: ' . $self->{_DATA_FILE_ID});
 	
-	$self->{_TABLE_ID_ROLLOVER} = int($self->{_RETENTION_SIZE} / 2**32);
-	if ($self->{_TABLE_ID_ROLLOVER} > $Num_tables){
-		$self->{_TABLE_ID_ROLLOVER} = int($self->{_TABLE_ID_ROLLOVER} / $Num_tables);
+	$self->{_TABLE_ID_ROLLOVER} = $Table_rollover;
+	if ($self->conf->get('table_rollover')){
+		$self->{_TABLE_ID_ROLLOVER} = int( $self->conf->get('table_rollover') );
 	}
-	else {
-		$Num_tables = $self->{_TABLE_ID_ROLLOVER};
+	# Make sure we have enough room for TABLE_ID_ROLLOVER number of files
+	if (2**32 * $self->{_TABLE_ID_ROLLOVER} > $self->{_RETENTION_SIZE}){
+		$self->{_TABLE_ID_ROLLOVER} = int($self->{_RETENTION_SIZE} / 2**32 / 2);
 	}
 	$self->log->debug('retention size: ' . $self->{_RETENTION_SIZE} . ' div 4gb: ' . int($self->{_RETENTION_SIZE} / 2**32));
-	$self->log->debug("Using a table id rollover of $self->{_TABLE_ID_ROLLOVER} and Num_tables $Num_tables");
+	$self->log->debug("Using a table id rollover of $self->{_TABLE_ID_ROLLOVER}");
 
 	$self->_init_db();
 	

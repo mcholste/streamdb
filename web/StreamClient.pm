@@ -234,7 +234,7 @@ EOT
 sub query {
 	my $self = shift;
 	my $given_params = shift;
-	my $is_retry = shift;
+	my $is_retry = shift || 0;
 	$self->log->debug('given_params: ' . Dumper($given_params) . ', is retry: ' . $is_retry);
 	
 	# Parse the query
