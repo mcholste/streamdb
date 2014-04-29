@@ -1,4 +1,10 @@
 #!/usr/bin/perl
+BEGIN {
+	($path) = $0 =~ /^(.+)\/[^\/]+$/;
+	if ($path){
+		push @INC, $path;
+	}
+}
 use strict;
 use warnings;
 use Data::Dumper;
