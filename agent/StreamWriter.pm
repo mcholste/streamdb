@@ -213,16 +213,6 @@ sub new {
 	
 	$self->{_ROLLOVER_CHECK} = $self->conf->get('rollover_check_frequency') ? $self->conf->get('rollover_check_frequency') : 10;
 
-	
-	if (($args->{daemonize} or $self->conf->get('daemonize'))){
-		my $user = $self->conf->get('user') ? $self->conf->get('user') : 'root';
-		my $group = $self->conf->get('group') ? $self->conf->get('group') : 'root';
-			
-		my $pid_file = $self->conf->get('pid_file') ? $self->conf->get('pid_file') : '/var/run/streamdb_' . $self->{_ID} . '.pid';
-		print "Daemonizing...\n";
-		daemonize($user, $group, $pid_file);
-	}
-	
 	return $self;
 }
 
@@ -300,6 +290,7 @@ sub db {
 
 sub run {
 	my $self = shift;
+	my $daemonize = shift;
 	my ($query, $sth);
 	
 	# Load any pre-existing tsv's
@@ -325,6 +316,16 @@ sub run {
 	my $cmd = "$self->{_VORTEX} $self->{_OPTIONS} -t $self->{_BUFFER_DIR} 2>&1";
 	$self->log->debug("cmd: $cmd");
 	open(FH, "-|", "$cmd");
+	
+	if ($daemonize or $self->conf->get('daemonize')){
+		my $user = $self->conf->get('user') ? $self->conf->get('user') : 'root';
+		my $group = $self->conf->get('group') ? $self->conf->get('group') : 'root';
+			
+		my $pid_file = $self->conf->get('pid_file') ? $self->conf->get('pid_file') : '/var/run/streamdb_' . $self->{_ID} . '.pid';
+		print "Daemonizing...\n";
+		daemonize($user, $group, $pid_file);
+	}
+	
 	while (<FH>){
 		my $line_num = $.;
 		chomp;

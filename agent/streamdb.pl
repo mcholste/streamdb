@@ -22,4 +22,4 @@ my $writer = new StreamWriter({
 	data_dir => $Opts{b},
 	database => $Opts{a},
 }) or die($!);
-$writer->run();
+$writer->run($Opts{D});
