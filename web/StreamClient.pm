@@ -102,7 +102,7 @@ sub call {
 					foreach my $row (@{ $result->{rows}->{$tuple} }){
 						for (my $i = 0; $i < @{ $row->{data} }; $i++){
 							my $ret_row = {};
-							foreach my $column qw(start srcip srcport dstip dstport duration length direction){
+							foreach my $column (qw(start srcip srcport dstip dstport duration length direction)){
 								$ret_row->{$column} = $row->{$column};
 							}
 							$ret_row->{reason} = $Reasons{ $row->{reason} };
